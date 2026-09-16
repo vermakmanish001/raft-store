@@ -37,3 +37,4 @@ Go 1.23 or later. No third-party dependencies.
 ## License
 
 MIT
+# raft-store
