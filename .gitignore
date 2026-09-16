@@ -1,0 +1,22 @@
+# Binaries
+/bin/
+/raftkv
+*.exe
+*.test
+*.out
+
+# Go build/test artifacts
+/vendor/
+coverage.out
+coverage.html
+
+# Local node data directories (Raft logs, snapshots)
+/data/
+*.db
+*.wal
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
