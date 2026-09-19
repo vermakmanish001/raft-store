@@ -409,13 +409,26 @@ func TestFollowerCampaignsAfterElectionTimeout(t *testing.T) {
 	}
 }
 
-// TestLeaderSendsHeartbeatsOnInterval pins the heartbeat cadence.
+// TestLeaderSendsHeartbeatsOnInterval pins the heartbeat cadence, and that a
+// heartbeat to a caught-up follower carries no entries.
 func TestLeaderSendsHeartbeatsOnInterval(t *testing.T) {
 	t.Parallel()
 
 	n := newTestNode(t, "n0", "n1", "n2") // heartbeat interval 3
 	n.becomeCandidate()
 	n.becomeLeader()
+
+	// A new leader appends a no-op for its term, so its first append carries
+	// that entry rather than being empty. Acknowledge it on both followers'
+	// behalf so they count as caught up.
+	noop := n.lastLogIndex()
+	for _, peer := range []NodeID{"n1", "n2"} {
+		n.Step(AppendEntriesResponse{
+			Header:     Header{From: peer, To: "n0", Term: n.Term()},
+			Success:    true,
+			MatchIndex: noop,
+		})
+	}
 
 	for i := range 2 {
 		if out := n.Tick(); len(out) != 0 {
@@ -433,8 +446,57 @@ func TestLeaderSendsHeartbeatsOnInterval(t *testing.T) {
 			t.Fatalf("got %T, want AppendEntries", m)
 		}
 		if len(ae.Entries) != 0 {
-			t.Errorf("heartbeat carried %d entries, want 0", len(ae.Entries))
+			t.Errorf("heartbeat to a caught-up follower carried %d entries, want 0", len(ae.Entries))
 		}
+		if ae.PrevLogIndex != noop {
+			t.Errorf("PrevLogIndex = %d, want %d", ae.PrevLogIndex, noop)
+		}
+	}
+}
+
+// TestNewLeaderAppendsNoOp covers the entry a leader adds for its own term.
+// See EntryNoOp: without it the commit index can never advance in an idle
+// cluster, stranding entries from the previous term.
+func TestNewLeaderAppendsNoOp(t *testing.T) {
+	t.Parallel()
+
+	n := newTestNode(t, "n0", "n1", "n2")
+	n.log = []LogEntry{{Term: 1, Index: 1, Type: EntryNormal, Command: []byte("old")}}
+	n.currentTerm = 1
+
+	n.becomeCandidate() // term 2
+	n.becomeLeader()
+
+	last, ok := n.entryAt(n.lastLogIndex())
+	if !ok {
+		t.Fatal("log is empty after becoming leader")
+	}
+	if last.Type != EntryNoOp {
+		t.Errorf("last entry type = %s, want %s", last.Type, EntryNoOp)
+	}
+	if last.Term != n.Term() {
+		t.Errorf("no-op term = %d, want the leader's own term %d", last.Term, n.Term())
+	}
+	if last.Index != 2 {
+		t.Errorf("no-op index = %d, want 2", last.Index)
+	}
+
+	// nextIndex is initialized before the no-op is appended, so it points at
+	// the no-op itself. That is what makes the first append carry the entry
+	// rather than waiting for a rejection to discover the follower needs it.
+	for _, peer := range []NodeID{"n1", "n2"} {
+		if got := n.nextIndex[peer]; got != 2 {
+			t.Errorf("nextIndex[%s] = %d, want 2 (the no-op's own index)", peer, got)
+		}
+		if got := n.matchIndex[peer]; got != 0 {
+			t.Errorf("matchIndex[%s] = %d, want 0; nothing is confirmed yet", peer, got)
+		}
+	}
+
+	// Confirm the first append actually carries it.
+	out := n.appendTo("n1")
+	if len(out.Entries) != 1 || out.Entries[0].Type != EntryNoOp {
+		t.Errorf("first append carried %d entries, want the no-op", len(out.Entries))
 	}
 }
 

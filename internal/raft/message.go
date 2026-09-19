@@ -94,6 +94,19 @@ type AppendEntriesResponse struct {
 	// inferring it from the request it sent, which matters because responses
 	// can arrive out of order or after the leader has moved on.
 	MatchIndex Index
+
+	// ConflictIndex and ConflictTerm accelerate recovery from a divergent log.
+	//
+	// The algorithm as described backs nextIndex up one entry per round trip,
+	// so a follower that missed a thousand entries needs a thousand
+	// exchanges. These fields let a follower describe where its log actually
+	// diverges, so the leader can skip an entire term in one step.
+	//
+	// This is an optimization, not a correctness requirement: the leader
+	// treats them as a hint and never advances nextIndex based on them. A
+	// follower that returned nonsense would only make recovery slower.
+	ConflictIndex Index
+	ConflictTerm  Term
 }
 
 // Compile-time assertions that every message type satisfies Message.

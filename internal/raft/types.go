@@ -74,6 +74,40 @@ func (r Role) String() string {
 	}
 }
 
+// EntryType distinguishes entries the state machine must apply from entries
+// that exist only to serve the algorithm.
+type EntryType uint8
+
+const (
+	// EntryNormal carries a client command for the state machine.
+	EntryNormal EntryType = iota
+
+	// EntryNoOp is appended by a new leader at the start of its term and
+	// carries no command.
+	//
+	// It exists to resolve a liveness problem created by the commit rule in
+	// Section 5.4.2. A leader may not mark entries from previous terms as
+	// committed merely because they are stored on a majority; it must commit
+	// an entry from its own term first. Without a no-op, a leader elected into
+	// an idle cluster would never append such an entry, so entries from the
+	// previous term would sit replicated but unapplied indefinitely. Appending
+	// one immediately makes the commit index advance on election rather than
+	// on the next client write.
+	EntryNoOp
+)
+
+// String implements fmt.Stringer for readable test output.
+func (t EntryType) String() string {
+	switch t {
+	case EntryNormal:
+		return "normal"
+	case EntryNoOp:
+		return "no-op"
+	default:
+		return fmt.Sprintf("EntryType(%d)", uint8(t))
+	}
+}
+
 // LogEntry is a single command in the replicated log.
 //
 // Term is carried on every entry, not just on the log as a whole, because the
@@ -84,6 +118,9 @@ func (r Role) String() string {
 type LogEntry struct {
 	Term  Term
 	Index Index
+
+	// Type tells the caller whether this entry should reach the state machine.
+	Type EntryType
 
 	// Command is the opaque payload handed to the state machine once the
 	// entry commits. The raft package never interprets it; keeping it opaque

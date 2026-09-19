@@ -108,6 +108,28 @@ type Node struct {
 	// produce, cannot be counted twice and manufacture a false majority.
 	votes map[NodeID]bool
 
+	// commitIndex is the highest index known to be committed, meaning it is
+	// durable across the cluster and safe to apply. lastApplied is how far the
+	// caller has actually consumed. The gap between them is the work queue
+	// that CommittedEntries drains.
+	//
+	// Both are volatile. A restarting node relearns its commit index from the
+	// leader rather than persisting it, because a committed entry is by
+	// definition already on a majority, so the information is recoverable.
+	commitIndex Index
+	lastApplied Index
+
+	// Leader-only bookkeeping, rebuilt on each election.
+	//
+	// nextIndex is the leader's guess at where each follower's log ends, and
+	// it is only a guess: a new leader optimistically assumes every follower
+	// matches its own log, then walks the value back as followers reject.
+	// matchIndex is what a follower has actually confirmed, and only it may be
+	// used to decide a commit. Conflating the two would let an optimistic
+	// guess be mistaken for durability.
+	nextIndex  map[NodeID]Index
+	matchIndex map[NodeID]Index
+
 	electionElapsed  int
 	heartbeatElapsed int
 
@@ -176,7 +198,7 @@ func (n *Node) Tick() []Message {
 		n.heartbeatElapsed++
 		if n.heartbeatElapsed >= n.cfg.HeartbeatInterval {
 			n.heartbeatElapsed = 0
-			return n.broadcastHeartbeat()
+			return n.broadcastAppend()
 		}
 
 	case Follower, Candidate:
@@ -284,6 +306,27 @@ func (n *Node) becomeLeader() {
 	// hear from the new leader they are still counting down to their own
 	// elections, so any delay here invites an unnecessary term change.
 	n.heartbeatElapsed = 0
+
+	// Reset per-follower state. nextIndex starts optimistically at the end of
+	// this leader's log, and matchIndex starts at zero: nothing is confirmed
+	// until a follower says so. Carrying either across terms would treat a
+	// previous leader's knowledge as this leader's, and the two logs may
+	// differ.
+	n.nextIndex = make(map[NodeID]Index, len(n.peers))
+	n.matchIndex = make(map[NodeID]Index, len(n.peers))
+	for _, peer := range n.peers {
+		n.nextIndex[peer] = n.lastLogIndex() + 1
+		n.matchIndex[peer] = 0
+	}
+
+	// Append a no-op for this term. See EntryNoOp: without an entry from its
+	// own term, a leader may never advance the commit index, leaving entries
+	// from the previous term replicated but unapplied.
+	n.appendEntry(n.currentTerm, EntryNoOp, nil)
+
+	// A single-node cluster has no followers to confirm anything, so the
+	// no-op is committed the moment it is appended.
+	n.maybeAdvanceCommit()
 }
 
 // resetElectionTimer clears the election countdown and draws a fresh random
@@ -299,6 +342,72 @@ func (n *Node) resetElectionTimer() {
 	n.electionTimeout = n.cfg.ElectionTimeoutMin + n.rand.Intn(spread)
 }
 
+// CommitIndex returns the highest index known to be committed.
+func (n *Node) CommitIndex() Index { return n.commitIndex }
+
+// LastApplied returns how far the caller has consumed committed entries.
+func (n *Node) LastApplied() Index { return n.lastApplied }
+
+// ErrNotLeader reports that a write was directed at a node that does not lead.
+//
+// It is a sentinel so callers can react rather than parse: the HTTP layer maps
+// it to a redirect toward Leader(), and a client library would retry there.
+var ErrNotLeader = errors.New("raft: not leader")
+
+// Propose submits a command for replication and returns the log index it was
+// assigned.
+//
+// Returning an index rather than waiting for commitment keeps this package
+// free of blocking. The caller watches CommittedEntries for that index to
+// appear, which is what lets one goroutine drive many concurrent requests.
+//
+// An index is a promise of position, not of durability. An entry appended by a
+// leader that is deposed before replicating it will be overwritten, so a
+// caller must wait for the entry to be committed rather than treating a
+// successful Propose as success.
+func (n *Node) Propose(command []byte) (Index, error) {
+	if n.role != Leader {
+		return 0, ErrNotLeader
+	}
+
+	entry := n.appendEntry(n.currentTerm, EntryNormal, command)
+
+	// A single-node cluster commits immediately; there is nobody to wait for.
+	n.maybeAdvanceCommit()
+
+	return entry.Index, nil
+}
+
+// CommittedEntries returns entries that have been committed but not yet
+// returned, advancing lastApplied past them.
+//
+// Entries are returned in log order and exactly once. The caller must apply
+// them in that order: every node applies the same entries in the same sequence
+// and must reach identical state, which is the entire purpose of the log.
+//
+// No-op entries are included rather than filtered. The caller decides what to
+// do with them, and hiding them here would make lastApplied disagree with what
+// the caller has seen.
+func (n *Node) CommittedEntries() []LogEntry {
+	if n.lastApplied >= n.commitIndex {
+		return nil
+	}
+
+	entries := make([]LogEntry, 0, n.commitIndex-n.lastApplied)
+	for i := n.lastApplied + 1; i <= n.commitIndex; i++ {
+		entry, ok := n.entryAt(i)
+		if !ok {
+			// Unreachable: commitIndex never exceeds the log. Stopping rather
+			// than indexing past the end keeps a bug elsewhere from becoming a
+			// panic in the apply path.
+			break
+		}
+		entries = append(entries, entry)
+		n.lastApplied = i
+	}
+	return entries
+}
+
 // quorum is the number of votes constituting a majority of the cluster,
 // including this node.
 //
@@ -308,20 +417,4 @@ func (n *Node) resetElectionTimer() {
 // merely half.
 func (n *Node) quorum() int {
 	return (len(n.peers)+1)/2 + 1
-}
-
-// lastLogIndex returns the index of the final log entry, or 0 for an empty log.
-func (n *Node) lastLogIndex() Index {
-	if len(n.log) == 0 {
-		return 0
-	}
-	return n.log[len(n.log)-1].Index
-}
-
-// lastLogTerm returns the term of the final log entry, or 0 for an empty log.
-func (n *Node) lastLogTerm() Term {
-	if len(n.log) == 0 {
-		return 0
-	}
-	return n.log[len(n.log)-1].Term
 }

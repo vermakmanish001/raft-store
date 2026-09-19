@@ -11,7 +11,7 @@ func (n *Node) campaign() []Message {
 	// responses that can never arrive.
 	if len(n.votes) >= n.quorum() {
 		n.becomeLeader()
-		return n.broadcastHeartbeat()
+		return n.broadcastAppend()
 	}
 
 	msgs := make([]Message, 0, len(n.peers))
@@ -106,5 +106,5 @@ func (n *Node) handleRequestVoteResponse(m RequestVoteResponse) []Message {
 
 	// Assert leadership immediately. Every other node is still counting down
 	// to its own election, and the first heartbeat is what stops them.
-	return n.broadcastHeartbeat()
+	return n.broadcastAppend()
 }

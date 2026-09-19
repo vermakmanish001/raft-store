@@ -15,18 +15,17 @@ Built incrementally. Each milestone is independently runnable and tested.
 |---|-----------|--------|
 | 1 | Single-node KV store with HTTP API | **Complete** |
 | 2 | Raft core: leader election | **Complete** |
-| 3 | Log replication | Next |
-| 4 | Replicated KV store over a real cluster | Planned |
+| 3 | Log replication | **Complete** |
+| 4 | Replicated KV store over a real cluster | Next |
 | 5 | Durable persistence and crash recovery | Planned |
 | 6 | Leader redirect, request dedup, linearizable reads | Planned |
 | 7 | Snapshots and log compaction | Planned |
 | 8 | Cluster membership and observability | Planned |
 
-Leader election is implemented and tested as a library, but is not yet wired
-into the running node. The `raftkv` binary still serves a single node from
-memory with no replication and no durability. Connecting the two happens once
-log replication exists, since a leader with no way to replicate writes would
-offer nothing a single node does not already do.
+Consensus is implemented and tested as a library: leader election, log
+replication, and commitment. It is not yet wired into the running node. The
+`raftkv` binary still serves a single node from memory with no replication and
+no durability. Connecting the two, over a real network transport, is next.
 
 ## Quickstart
 
@@ -119,6 +118,19 @@ Timeouts are counted in ticks rather than durations, so the caller decides what
 a tick means. Production drives it from a ticker; tests drive it in a loop and
 resolve a full election in microseconds.
 
+The subtlest requirement in Raft is the commit rule of Section 5.4.2, shown in
+Figure 8 of the paper: a leader may only mark an entry committed by counting
+replicas if that entry belongs to the leader's own term. An entry from an
+earlier term can sit on a majority and still be legitimately overwritten by a
+future leader, so committing it on replica count alone can destroy data that
+was already applied and acknowledged. Entries from previous terms become
+committed indirectly, carried along when an entry from the current term
+commits above them.
+
+That rule is worth calling out because deleting it leaves every other test in
+the suite passing. Only `TestFigure8CommitRule` fails, which is exactly why it
+exists.
+
 The key-value store has no knowledge of Raft. Replication is layered on top of
 it rather than woven into it, and store errors are sentinels tested with
 `errors.Is`. The function `errorStatus` in the API package is the single place
@@ -155,7 +167,7 @@ It asserts the status code of all fifteen request cases, prints a pass or fail
 line for each, cleans up the keys it wrote, and exits non-zero if any case
 fails, so it can be wired into CI later.
 
-Current coverage: 100% of `internal/store`, 99% of `internal/raft`, 84% of
+Current coverage: 100% of `internal/store`, 98% of `internal/raft`, 84% of
 `internal/api`.
 
 ## License
