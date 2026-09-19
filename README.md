@@ -14,17 +14,19 @@ Built incrementally. Each milestone is independently runnable and tested.
 | # | Milestone | Status |
 |---|-----------|--------|
 | 1 | Single-node KV store with HTTP API | **Complete** |
-| 2 | Raft core: leader election | Next |
-| 3 | Log replication | Planned |
+| 2 | Raft core: leader election | **Complete** |
+| 3 | Log replication | Next |
 | 4 | Replicated KV store over a real cluster | Planned |
 | 5 | Durable persistence and crash recovery | Planned |
 | 6 | Leader redirect, request dedup, linearizable reads | Planned |
 | 7 | Snapshots and log compaction | Planned |
 | 8 | Cluster membership and observability | Planned |
 
-Milestone 1 is a single node with no replication and no durability. Data lives
-in memory and is lost on exit. That is the intended scope: it establishes the
-storage and transport boundaries that Raft is layered onto from Milestone 2.
+Leader election is implemented and tested as a library, but is not yet wired
+into the running node. The `raftkv` binary still serves a single node from
+memory with no replication and no durability. Connecting the two happens once
+log replication exists, since a leader with no way to replicate writes would
+offer nothing a single node does not already do.
 
 ## Quickstart
 
@@ -91,17 +93,38 @@ conflated with readiness to serve reads.
 
 ## Design
 
-The consensus core (`internal/raft`, from Milestone 2) performs no I/O. It
-communicates through `transport` and `storage` interfaces, which makes
-elections and replication testable deterministically, without sleeps or real
-sockets. The key-value store (`internal/store`) has no knowledge of Raft;
-replication is layered on top of it rather than woven into it.
-
 ```
 cmd/raftkv/         node entrypoint: flags, wiring, graceful shutdown
 internal/store/     storage engine, concurrency-safe, knows nothing of Raft
 internal/api/       HTTP transport: routing, status codes, encoding
+internal/raft/      consensus state machine: no goroutines, no clock, no I/O
 ```
+
+The consensus core is a pure state machine. It has no goroutines, no timers,
+and no network or disk access. Callers drive it with `Tick`, which advances
+logical time by one unit, and `Step`, which delivers one message. Both return
+the messages the caller should send. Nothing inside the package blocks, sleeps,
+or opens a socket.
+
+That is a testing decision above all. Consensus bugs are ordering bugs, and
+they appear only under interleavings that are rare on a healthy network: a vote
+arriving after the term moved on, two candidates campaigning at once, a leader
+deposed mid-broadcast. Driving the algorithm with an explicit clock lets a test
+construct those interleavings exactly and replay them identically every run.
+The test suite partitions leaders, heals partitions, and asserts that two nodes
+never lead the same term, across hundreds of randomized but seeded rounds, in
+under a second and with no `time.Sleep` anywhere.
+
+Timeouts are counted in ticks rather than durations, so the caller decides what
+a tick means. Production drives it from a ticker; tests drive it in a loop and
+resolve a full election in microseconds.
+
+The key-value store has no knowledge of Raft. Replication is layered on top of
+it rather than woven into it, and store errors are sentinels tested with
+`errors.Is`. The function `errorStatus` in the API package is the single place
+where a storage failure becomes an HTTP status code, so replication-specific
+failures such as "this node is not the leader" extend one function rather than
+every handler.
 
 Store errors are sentinels tested with `errors.Is`, and `errorStatus` in the
 API package is the single place where a storage failure becomes an HTTP status
@@ -132,7 +155,8 @@ It asserts the status code of all fifteen request cases, prints a pass or fail
 line for each, cleans up the keys it wrote, and exits non-zero if any case
 fails, so it can be wired into CI later.
 
-Current coverage: 100% of `internal/store`, 84% of `internal/api`.
+Current coverage: 100% of `internal/store`, 99% of `internal/raft`, 84% of
+`internal/api`.
 
 ## License
 
