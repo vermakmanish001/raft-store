@@ -23,6 +23,20 @@ type Header struct {
 
 func (h Header) header() Header { return h }
 
+// Sender returns the node a message came from.
+//
+// The header method is unexported so that the set of message types stays
+// closed to this package. These functions give transports the routing fields
+// they need without opening that door, and without adding methods that would
+// collide with Header's own field names.
+func Sender(m Message) NodeID { return m.header().From }
+
+// Recipient returns the node a message is addressed to.
+func Recipient(m Message) NodeID { return m.header().To }
+
+// MessageTerm returns the term a message was sent in.
+func MessageTerm(m Message) Term { return m.header().Term }
+
 // RequestVote is sent by a candidate to gather votes (Section 5.2).
 type RequestVote struct {
 	Header

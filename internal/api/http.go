@@ -15,8 +15,17 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/vermakmanish001/raft-store/internal/raft"
+	"github.com/vermakmanish001/raft-store/internal/replica"
 	"github.com/vermakmanish001/raft-store/internal/store"
 )
+
+// Cluster reports consensus state. It is optional: a single-node deployment
+// has none, and the API behaves identically apart from redirects and the
+// status endpoint.
+type Cluster interface {
+	Status() replica.Status
+}
 
 // DefaultMaxBodyBytes caps the size of a value accepted by PUT. Without a cap,
 // a single request could exhaust node memory; once entries flow through the
@@ -29,6 +38,7 @@ const DefaultMaxBodyBytes int64 = 1 << 20 // 1 MiB
 // the Store it wraps is required to be goroutine-safe.
 type Server struct {
 	store        store.Store
+	cluster      Cluster
 	logger       *slog.Logger
 	maxBodyBytes int64
 }
@@ -39,6 +49,12 @@ type Option func(*Server)
 // WithMaxBodyBytes overrides the maximum accepted value size.
 func WithMaxBodyBytes(n int64) Option {
 	return func(s *Server) { s.maxBodyBytes = n }
+}
+
+// WithCluster attaches consensus state, enabling leader redirection and the
+// status endpoint.
+func WithCluster(c Cluster) Option {
+	return func(s *Server) { s.cluster = c }
 }
 
 // NewServer returns a Server backed by st. A nil logger discards output.
@@ -70,6 +86,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /kv/{key}", s.handlePut)
 	mux.HandleFunc("DELETE /kv/{key}", s.handleDelete)
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /status", s.handleStatus)
 
 	return logRequests(s.logger)(mux)
 }
@@ -136,8 +153,26 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, r, http.StatusOK, healthResponse{Status: "ok"})
 }
 
+// handleStatus reports consensus state: this node's role, term, and who it
+// believes leads. Unlike /health it says nothing about liveness, so a load
+// balancer should not probe it.
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if s.cluster == nil {
+		s.writeJSON(w, r, http.StatusOK, map[string]string{"mode": "single-node"})
+		return
+	}
+	s.writeJSON(w, r, http.StatusOK, s.cluster.Status())
+}
+
 // writeError maps a store error to a status code and JSON body.
 func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
+	// A write that reached the wrong node is redirected rather than refused,
+	// so a client that guessed wrong is not required to understand the
+	// cluster's topology.
+	if errors.Is(err, raft.ErrNotLeader) && s.redirectToLeader(w, r) {
+		return
+	}
+
 	status, message := errorStatus(err)
 
 	// A 5xx means a bug or an unmapped error type, so log the underlying
@@ -161,9 +196,45 @@ func errorStatus(err error) (int, string) {
 		return http.StatusNotFound, "key not found"
 	case errors.Is(err, store.ErrEmptyKey):
 		return http.StatusBadRequest, "key must not be empty"
+
+	case errors.Is(err, raft.ErrNotLeader):
+		// Reached only when the leader is unknown, since a known leader is
+		// redirected to instead. The cluster is mid-election and the client
+		// should retry shortly.
+		return http.StatusServiceUnavailable, "no leader elected, retry shortly"
+
+	case errors.Is(err, replica.ErrTimeout):
+		// Deliberately not reported as a failure. The entry may still commit,
+		// so the outcome is genuinely unknown and the client must retry and
+		// tolerate the write having already happened.
+		return http.StatusServiceUnavailable, "timed out waiting for replication, outcome unknown"
+
+	case errors.Is(err, replica.ErrShuttingDown):
+		return http.StatusServiceUnavailable, "node is shutting down"
+
 	default:
 		return http.StatusInternalServerError, "internal error"
 	}
+}
+
+// redirectToLeader sends the client to the current leader, reporting whether
+// it was able to.
+//
+// The redirect is 307 rather than 302 because 307 requires the client to
+// repeat the method and body unchanged. A PUT redirected as 302 may legally
+// be retried as a GET, which would silently discard the write.
+func (s *Server) redirectToLeader(w http.ResponseWriter, r *http.Request) bool {
+	if s.cluster == nil {
+		return false
+	}
+
+	addr := s.cluster.Status().LeaderAddr
+	if addr == "" {
+		return false // mid-election: nobody to redirect to
+	}
+
+	http.Redirect(w, r, addr+r.URL.RequestURI(), http.StatusTemporaryRedirect)
+	return true
 }
 
 // writeJSON encodes v as the response body.

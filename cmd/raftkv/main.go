@@ -1,8 +1,13 @@
 // Command raftkv runs a raft-store node.
 //
-// At Milestone 1 a node is standalone: it serves the key-value API from memory
-// with no replication and no durability, so all data is lost on exit. Raft
-// joins the picture at Milestone 2.
+// A node serves the key-value API to clients and Raft RPCs to its peers, both
+// on one listener. Production would separate them, so peer traffic could sit
+// on a private network with its own authentication, but one port keeps a local
+// cluster easy to run.
+//
+// Started with no peers, a node forms a single-member cluster: it elects
+// itself immediately and commits on append. The code path is identical to a
+// larger cluster, so there is no untested special case for running alone.
 package main
 
 import (
@@ -15,15 +20,18 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/vermakmanish001/raft-store/internal/api"
+	"github.com/vermakmanish001/raft-store/internal/config"
+	"github.com/vermakmanish001/raft-store/internal/raft"
+	"github.com/vermakmanish001/raft-store/internal/replica"
 	"github.com/vermakmanish001/raft-store/internal/store"
+	"github.com/vermakmanish001/raft-store/internal/transport"
 )
 
-// shutdownTimeout bounds how long in-flight requests have to finish once a
-// termination signal arrives, after which the process exits regardless.
 const shutdownTimeout = 10 * time.Second
 
 func main() {
@@ -33,13 +41,14 @@ func main() {
 	}
 }
 
-// run holds the real body of main so that every exit path returns an error
-// instead of calling os.Exit, which would skip deferred cleanup.
 func run() error {
 	var (
-		addr     = flag.String("addr", ":8080", "host:port for the HTTP API")
-		logLevel = flag.String("log-level", "info", "log verbosity: debug, info, warn, error")
-		logJSON  = flag.Bool("log-json", false, "emit logs as JSON instead of text")
+		id        = flag.String("id", "node1", "unique ID for this node within the cluster")
+		addr      = flag.String("addr", ":8080", "host:port for the client API and peer RPC")
+		peerSpec  = flag.String("peers", "", "other nodes, as id=url[,id=url...]")
+		advertise = flag.String("advertise", "", "base URL peers and clients use to reach this node")
+		logLevel  = flag.String("log-level", "info", "log verbosity: debug, info, warn, error")
+		logJSON   = flag.Bool("log-json", false, "emit logs as JSON instead of text")
 	)
 	flag.Parse()
 
@@ -48,36 +57,21 @@ func run() error {
 		return err
 	}
 
-	// Signals are translated into context cancellation so that shutdown
-	// follows the same path as any other cancellation. stop must be called to
-	// restore default signal handling, which is what makes a second Ctrl-C
-	// kill a process that is wedged mid-shutdown.
+	peers, err := config.ParsePeers(*peerSpec)
+	if err != nil {
+		return err
+	}
+	if _, self := peers[raft.NodeID(*id)]; self {
+		return fmt.Errorf("-peers must not list this node's own ID %q", *id)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv := &http.Server{
-		Handler: api.NewServer(store.New(), logger).Handler(),
-
-		// ReadHeaderTimeout bounds how long a client may take to send its
-		// headers. Without it, idle connections that never complete a request
-		// accumulate until the process runs out of file descriptors.
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
-	}
-
-	// Bind before starting the serve goroutine, so that a bind failure is
-	// returned synchronously and the "listening" line is logged only once the
-	// port is actually held. Logging from inside the goroutine would announce
-	// success a moment before ListenAndServe could fail, which reads as a node
-	// that started and then died for no reason.
+	// Bind before announcing anything, so a port collision is reported as an
+	// actionable error rather than a node that claims to start and then dies.
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
-		// A port collision is operator error, not a bug, and it is by far the
-		// most common startup failure. Say what to do about it rather than
-		// surfacing the raw syscall error.
 		if errors.Is(err, syscall.EADDRINUSE) {
 			return fmt.Errorf("cannot bind %s: another process is already listening there; "+
 				"choose a free port with -addr, for example -addr :8081", *addr)
@@ -85,25 +79,59 @@ func run() error {
 		return fmt.Errorf("cannot bind %s: %w", *addr, err)
 	}
 
-	// Report the resolved address rather than the flag, so that -addr :0 shows
-	// the port the kernel actually chose.
+	// Client addresses include this node, so a status response names its own
+	// address when it is the leader.
+	clientAddrs := make(map[raft.NodeID]string, len(peers)+1)
+	for peerID, url := range peers {
+		clientAddrs[peerID] = url
+	}
+	clientAddrs[raft.NodeID(*id)] = advertisedURL(*advertise, *addr, listener)
+
+	tr := transport.NewHTTP(raft.NodeID(*id), peers, logger)
+	tr.Start()
+	defer tr.Close()
+
+	rep, err := replica.New(replica.Config{
+		ID:          raft.NodeID(*id),
+		Peers:       config.PeerIDs(peers),
+		ClientAddrs: clientAddrs,
+		Transport:   tr,
+		Store:       store.New(),
+		Logger:      logger,
+	})
+	if err != nil {
+		return err
+	}
+	rep.Start()
+	defer rep.Close()
+
+	// Peer traffic is routed outside the client API so that heartbeats, which
+	// arrive many times a second, do not flood the request log.
+	root := http.NewServeMux()
+	root.Handle("POST "+transport.Path, tr.Handler())
+	root.Handle("/", api.NewServer(rep, logger, api.WithCluster(rep)).Handler())
+
+	srv := &http.Server{
+		Handler:           root,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
+	}
+
 	logger.Info("node listening",
+		slog.String("id", *id),
 		slog.String("addr", listener.Addr().String()),
-		slog.String("mode", "single-node"),
+		slog.Int("peers", len(peers)),
+		slog.String("mode", clusterMode(len(peers))),
 	)
 
-	// Serve blocks, so it runs on its own goroutine and reports its outcome
-	// back through a buffered channel. The buffer keeps the goroutine from
-	// leaking if the shutdown path wins the race and nobody ever reads.
 	serveErr := make(chan error, 1)
-	go func() {
-		serveErr <- srv.Serve(listener)
-	}()
+	go func() { serveErr <- srv.Serve(listener) }()
 
 	select {
 	case err := <-serveErr:
-		// ErrServerClosed only appears after an explicit Shutdown, which has
-		// not happened on this branch, so any error here is a real failure.
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return fmt.Errorf("http server: %w", err)
 		}
@@ -111,8 +139,7 @@ func run() error {
 
 	case <-ctx.Done():
 		logger.Info("shutdown signal received, draining connections",
-			slog.Duration("timeout", shutdownTimeout),
-		)
+			slog.Duration("timeout", shutdownTimeout))
 		stop()
 	}
 
@@ -127,7 +154,34 @@ func run() error {
 	return nil
 }
 
-// newLogger builds the process logger from the parsed flags.
+// advertisedURL determines the address peers and clients should use to reach
+// this node.
+//
+// An explicit -advertise wins. Otherwise the bound address is used, with a
+// wildcard host replaced by loopback: a peer told to connect to "0.0.0.0"
+// would dial an address that means "every interface here", not "that machine".
+func advertisedURL(advertise, addr string, listener net.Listener) string {
+	if advertise != "" {
+		return strings.TrimSuffix(advertise, "/")
+	}
+
+	host, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		return "http://" + addr
+	}
+	if host == "" || host == "::" || host == "0.0.0.0" {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port)
+}
+
+func clusterMode(peerCount int) string {
+	if peerCount == 0 {
+		return "single-node"
+	}
+	return "cluster"
+}
+
 func newLogger(level string, asJSON bool) (*slog.Logger, error) {
 	var lvl slog.Level
 	if err := lvl.UnmarshalText([]byte(level)); err != nil {

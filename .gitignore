@@ -20,3 +20,6 @@ coverage.html
 .idea/
 .vscode/
 *.swp
+
+# Local demo cluster state
+/.cluster/

@@ -10,12 +10,12 @@ func TestProposeRejectedByNonLeader(t *testing.T) {
 
 	n := newTestNode(t, "n0", "n1", "n2")
 
-	if _, err := n.Propose([]byte("x")); !errors.Is(err, ErrNotLeader) {
+	if _, _, err := n.Propose([]byte("x")); !errors.Is(err, ErrNotLeader) {
 		t.Errorf("Propose on a follower: error = %v, want %v", err, ErrNotLeader)
 	}
 
 	n.becomeCandidate()
-	if _, err := n.Propose([]byte("x")); !errors.Is(err, ErrNotLeader) {
+	if _, _, err := n.Propose([]byte("x")); !errors.Is(err, ErrNotLeader) {
 		t.Errorf("Propose on a candidate: error = %v, want %v", err, ErrNotLeader)
 	}
 }
@@ -31,7 +31,7 @@ func TestSingleNodeCommitsImmediately(t *testing.T) {
 	}
 
 	n := c.nodes["n0"]
-	index, err := n.Propose([]byte("set x=1"))
+	index, _, err := n.Propose([]byte("set x=1"))
 	if err != nil {
 		t.Fatalf("Propose: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestFigure8CommitRule(t *testing.T) {
 
 	// Appending an entry in the leader's own term and replicating it to a
 	// majority commits that entry, and carries the earlier one with it.
-	index, err := n.Propose([]byte("current term write"))
+	index, _, err := n.Propose([]byte("current term write"))
 	if err != nil {
 		t.Fatalf("Propose: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestCommitRequiresMajority(t *testing.T) {
 	n.becomeCandidate()
 	n.becomeLeader()
 
-	index, err := n.Propose([]byte("x"))
+	index, _, err := n.Propose([]byte("x"))
 	if err != nil {
 		t.Fatalf("Propose: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestCommittedEntriesDrainedExactlyOnce(t *testing.T) {
 	c.advanceUntil(50, func() bool { return len(c.leaders()) == 1 })
 	n := c.nodes["n0"]
 
-	if _, err := n.Propose([]byte("a")); err != nil {
+	if _, _, err := n.Propose([]byte("a")); err != nil {
 		t.Fatalf("Propose: %v", err)
 	}
 
@@ -158,7 +158,7 @@ func TestCommittedEntriesDrainedExactlyOnce(t *testing.T) {
 		t.Errorf("second drain returned %d entries, want 0; entries must be delivered once", len(second))
 	}
 
-	if _, err := n.Propose([]byte("b")); err != nil {
+	if _, _, err := n.Propose([]byte("b")); err != nil {
 		t.Fatalf("Propose: %v", err)
 	}
 	third := n.CommittedEntries()
@@ -372,7 +372,7 @@ func TestClusterReplicatesAndCommits(t *testing.T) {
 	c := newCluster(t, 3)
 	leader := c.elect()
 
-	index, err := leader.Propose([]byte("set x=1"))
+	index, _, err := leader.Propose([]byte("set x=1"))
 	if err != nil {
 		t.Fatalf("Propose: %v", err)
 	}
@@ -420,7 +420,7 @@ func TestCommittedEntriesSurviveLeaderFailure(t *testing.T) {
 
 	var lastIndex Index
 	for _, cmd := range []string{"a", "b", "c"} {
-		index, err := leader.Propose([]byte(cmd))
+		index, _, err := leader.Propose([]byte(cmd))
 		if err != nil {
 			t.Fatalf("Propose(%s): %v", cmd, err)
 		}
@@ -488,7 +488,7 @@ func TestFollowerCatchesUpAfterPartition(t *testing.T) {
 	c.isolate(lagging)
 
 	for i := range 25 {
-		if _, err := leader.Propose([]byte{byte('a' + i%26)}); err != nil {
+		if _, _, err := leader.Propose([]byte{byte('a' + i%26)}); err != nil {
 			t.Fatalf("Propose: %v", err)
 		}
 		c.advance(2)
@@ -765,7 +765,7 @@ func TestLastAppliedTracksDrain(t *testing.T) {
 		t.Errorf("LastApplied() = %d, want 0 before draining", n.LastApplied())
 	}
 
-	index, err := n.Propose([]byte("x"))
+	index, _, err := n.Propose([]byte("x"))
 	if err != nil {
 		t.Fatalf("Propose: %v", err)
 	}

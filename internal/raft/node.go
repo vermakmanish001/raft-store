@@ -354,8 +354,8 @@ func (n *Node) LastApplied() Index { return n.lastApplied }
 // it to a redirect toward Leader(), and a client library would retry there.
 var ErrNotLeader = errors.New("raft: not leader")
 
-// Propose submits a command for replication and returns the log index it was
-// assigned.
+// Propose submits a command for replication, returning the log index it was
+// assigned and the messages the caller must send.
 //
 // Returning an index rather than waiting for commitment keeps this package
 // free of blocking. The caller watches CommittedEntries for that index to
@@ -365,9 +365,9 @@ var ErrNotLeader = errors.New("raft: not leader")
 // leader that is deposed before replicating it will be overwritten, so a
 // caller must wait for the entry to be committed rather than treating a
 // successful Propose as success.
-func (n *Node) Propose(command []byte) (Index, error) {
+func (n *Node) Propose(command []byte) (Index, []Message, error) {
 	if n.role != Leader {
-		return 0, ErrNotLeader
+		return 0, nil, ErrNotLeader
 	}
 
 	entry := n.appendEntry(n.currentTerm, EntryNormal, command)
@@ -375,7 +375,10 @@ func (n *Node) Propose(command []byte) (Index, error) {
 	// A single-node cluster commits immediately; there is nobody to wait for.
 	n.maybeAdvanceCommit()
 
-	return entry.Index, nil
+	// Replicate now rather than waiting for the next heartbeat. Otherwise
+	// every write would pay up to one heartbeat interval of latency for no
+	// reason.
+	return entry.Index, n.broadcastAppend(), nil
 }
 
 // CommittedEntries returns entries that have been committed but not yet

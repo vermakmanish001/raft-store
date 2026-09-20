@@ -16,26 +16,62 @@ Built incrementally. Each milestone is independently runnable and tested.
 | 1 | Single-node KV store with HTTP API | **Complete** |
 | 2 | Raft core: leader election | **Complete** |
 | 3 | Log replication | **Complete** |
-| 4 | Replicated KV store over a real cluster | Next |
-| 5 | Durable persistence and crash recovery | Planned |
+| 4 | Replicated KV store over a real cluster | **Complete** |
+| 5 | Durable persistence and crash recovery | Next |
 | 6 | Leader redirect, request dedup, linearizable reads | Planned |
 | 7 | Snapshots and log compaction | Planned |
 | 8 | Cluster membership and observability | Planned |
 
-Consensus is implemented and tested as a library: leader election, log
-replication, and commitment. It is not yet wired into the running node. The
-`raftkv` binary still serves a single node from memory with no replication and
-no durability. Connecting the two, over a real network transport, is next.
+A cluster replicates writes, elects leaders, and survives the loss of any
+minority of its nodes. Three limitations remain, each addressed by a later
+step and each stated plainly rather than hidden:
+
+- **No durability.** State lives in memory. A node that restarts rejoins with
+  an empty log and is refilled by the leader, so a cluster survives losing a
+  minority, but not a simultaneous restart of a majority.
+- **Writes are at-least-once.** A write interrupted by a leader change is
+  reported as failed, and a client retry applies it twice. Fixing this needs
+  request deduplication held in replicated state.
+- **Reads are not linearizable.** They are served from the leader's applied
+  state, which can lag or come from a leader that has already been deposed
+  without noticing.
 
 ## Quickstart
 
 Requires Go 1.23 or later. There are no third-party dependencies.
 
-Start a node:
+Start a single node:
 
 ```bash
 make run
 ```
+
+Or a three-node cluster on ports 8181 through 8183:
+
+```bash
+make cluster                 # build and launch three nodes
+make cluster-status          # each node's role, term, and commit index
+make cluster-kill-leader     # stop the leader and watch failover
+make cluster-stop
+```
+
+Writes go to the leader. Addressing a follower returns a 307 redirect, which
+`curl -L` follows while preserving the method and body. To watch a write
+survive the loss of the node that accepted it:
+
+```bash
+scripts/cluster.sh put durable 'survives a crash'
+make cluster-kill-leader
+scripts/cluster.sh get durable
+```
+
+The value comes back from a node that was never the one you wrote to.
+
+Those helpers pick whichever node is reachable rather than a fixed port, which
+matters more than it sounds: the leader is whichever node wins the election,
+so the node `kill-leader` stops differs from run to run. A hardcoded address
+lands on the dead node about a third of the time, and `curl -s` hides the
+connection error, making a healthy cluster look like data loss.
 
 Then, from a second terminal:
 
@@ -72,6 +108,8 @@ segment, so a key containing a slash does not match a route.
 | `PUT` | `/kv/{key}` | `204`, no body | `413` if the value exceeds 1 MiB |
 | `DELETE` | `/kv/{key}` | `204`, no body | `404` if absent |
 | `GET` | `/health` | `200` with `{"status":"ok"}` | |
+| `GET` | `/status` | `200` with role, term, leader, commit index | |
+| `POST` | `/raft/message` | `202`, peer RPC, not for clients | |
 
 `PUT` is idempotent and returns `204` for both a create and an overwrite,
 because the store does not distinguish the two. An empty body stores an empty
@@ -94,10 +132,32 @@ conflated with readiness to serve reads.
 
 ```
 cmd/raftkv/         node entrypoint: flags, wiring, graceful shutdown
-internal/store/     storage engine, concurrency-safe, knows nothing of Raft
-internal/api/       HTTP transport: routing, status codes, encoding
 internal/raft/      consensus state machine: no goroutines, no clock, no I/O
+internal/replica/   drives consensus: owns the loop, clock, and pending writes
+internal/transport/ Raft RPCs over HTTP, plus the wire codec
+internal/fsm/       turns committed log entries into store mutations
+internal/store/     storage engine, concurrency-safe, knows nothing of Raft
+internal/api/       client HTTP: routing, status codes, leader redirection
+internal/config/    cluster configuration parsing
 ```
+
+The dependency arrows all point one way. The store knows nothing of Raft, the
+raft package knows nothing of HTTP or the store, and `replica` is the only
+place all three meet. That is why swapping the in-memory store for a
+replicated one required no change to the API layer at all: `Replica` satisfies
+the same `store.Store` interface that `MemStore` does, so the HTTP handlers
+never learned that replication exists.
+
+One goroutine owns the consensus node. It is the only thing permitted to touch
+that state, which is what makes the raft package's complete absence of
+internal locking safe rather than reckless. Client writes reach it through a
+channel and wait on a per-entry registry keyed by log index.
+
+A pending write records the term its entry was appended in. If a different
+entry commits at that index, this node was deposed and the client's write
+never happened, so it is reported as a failure rather than a success. Without
+that check a client would be told its write succeeded when another leader's
+entry had taken the slot.
 
 The consensus core is a pure state machine. It has no goroutines, no timers,
 and no network or disk access. Callers drive it with `Tick`, which advances
@@ -167,8 +227,8 @@ It asserts the status code of all fifteen request cases, prints a pass or fail
 line for each, cleans up the keys it wrote, and exits non-zero if any case
 fails, so it can be wired into CI later.
 
-Current coverage: 100% of `internal/store`, 98% of `internal/raft`, 84% of
-`internal/api`.
+Coverage by package: store and config at 100%, raft 97%, fsm 94%, replica 92%,
+api 91%, transport 85%.
 
 ## License
 

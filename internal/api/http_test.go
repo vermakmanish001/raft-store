@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/vermakmanish001/raft-store/internal/api"
+	"github.com/vermakmanish001/raft-store/internal/raft"
+	"github.com/vermakmanish001/raft-store/internal/replica"
 	"github.com/vermakmanish001/raft-store/internal/store"
 )
 
@@ -232,3 +234,162 @@ func decode(t *testing.T, rec *httptest.ResponseRecorder, v any) {
 		t.Fatalf("decoding body %q: %v", rec.Body.String(), err)
 	}
 }
+
+// stubCluster reports a fixed consensus state.
+type stubCluster struct{ status replica.Status }
+
+func (s stubCluster) Status() replica.Status { return s.status }
+
+// TestLeaderRedirect covers the path a client hits when it addresses a
+// follower. The write must be forwarded rather than refused.
+func TestLeaderRedirect(t *testing.T) {
+	t.Parallel()
+
+	h := api.NewServer(
+		notLeaderStore{},
+		nil,
+		api.WithCluster(stubCluster{status: replica.Status{
+			ID:         "n2",
+			Role:       "follower",
+			Leader:     "n1",
+			LeaderAddr: "http://127.0.0.1:9001",
+		}}),
+	).Handler()
+
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		want   string
+	}{
+		{"put", http.MethodPut, "/kv/alpha", "http://127.0.0.1:9001/kv/alpha"},
+		{"get", http.MethodGet, "/kv/alpha", "http://127.0.0.1:9001/kv/alpha"},
+		{"delete", http.MethodDelete, "/kv/alpha", "http://127.0.0.1:9001/kv/alpha"},
+		{"query string is preserved", http.MethodGet, "/kv/alpha?x=1", "http://127.0.0.1:9001/kv/alpha?x=1"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := do(t, h, tc.method, tc.path, "body")
+
+			// 307 rather than 302: a 302 may legally be retried as a GET,
+			// which would silently discard the write.
+			if rec.Code != http.StatusTemporaryRedirect {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusTemporaryRedirect)
+			}
+			if got := rec.Header().Get("Location"); got != tc.want {
+				t.Errorf("Location = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNoLeaderReturnsUnavailable: mid-election there is nobody to redirect to.
+func TestNoLeaderReturnsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	h := api.NewServer(
+		notLeaderStore{},
+		nil,
+		api.WithCluster(stubCluster{status: replica.Status{ID: "n2", Role: "follower"}}),
+	).Handler()
+
+	rec := do(t, h, http.MethodPut, "/kv/alpha", "value")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+}
+
+// TestNotLeaderWithoutClusterIsUnavailable guards the nil-cluster path.
+func TestNotLeaderWithoutClusterIsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	h := api.NewServer(notLeaderStore{}, nil).Handler()
+
+	rec := do(t, h, http.MethodPut, "/kv/alpha", "value")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestStatusEndpoint(t *testing.T) {
+	t.Parallel()
+
+	t.Run("reports consensus state", func(t *testing.T) {
+		t.Parallel()
+
+		h := api.NewServer(store.New(), nil, api.WithCluster(stubCluster{
+			status: replica.Status{ID: "n1", Role: "leader", Term: 7, Leader: "n1", CommitIndex: 12},
+		})).Handler()
+
+		rec := do(t, h, http.MethodGet, "/status", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+
+		var got replica.Status
+		decode(t, rec, &got)
+		if got.Role != "leader" || got.Term != 7 || got.CommitIndex != 12 {
+			t.Errorf("body = %+v, want leader at term 7 with commit 12", got)
+		}
+	})
+
+	t.Run("reports single-node mode without a cluster", func(t *testing.T) {
+		t.Parallel()
+
+		h := api.NewServer(store.New(), nil).Handler()
+
+		rec := do(t, h, http.MethodGet, "/status", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+
+		var got map[string]string
+		decode(t, rec, &got)
+		if got["mode"] != "single-node" {
+			t.Errorf("body = %v, want single-node mode", got)
+		}
+	})
+}
+
+func TestReplicationErrorsMapToStatusCodes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"timeout is unavailable, not a failure", replica.ErrTimeout, http.StatusServiceUnavailable},
+		{"shutting down", replica.ErrShuttingDown, http.StatusServiceUnavailable},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := api.NewServer(erroringStore{err: tc.err}, nil).Handler()
+
+			rec := do(t, h, http.MethodPut, "/kv/alpha", "value")
+			if rec.Code != tc.want {
+				t.Errorf("status = %d, want %d", rec.Code, tc.want)
+			}
+		})
+	}
+}
+
+// notLeaderStore fails every operation the way a follower does.
+type notLeaderStore struct{}
+
+func (notLeaderStore) Get(string) (string, error) { return "", raft.ErrNotLeader }
+func (notLeaderStore) Put(string, string) error   { return raft.ErrNotLeader }
+func (notLeaderStore) Delete(string) error        { return raft.ErrNotLeader }
+
+// erroringStore fails every operation with a fixed error.
+type erroringStore struct{ err error }
+
+func (s erroringStore) Get(string) (string, error) { return "", s.err }
+func (s erroringStore) Put(string, string) error   { return s.err }
+func (s erroringStore) Delete(string) error        { return s.err }

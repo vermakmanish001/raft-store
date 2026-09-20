@@ -7,7 +7,8 @@ PKG    := ./...
 # occupied on this machine. Override with: make run ADDR=:9999
 ADDR   ?= :8081
 
-.PHONY: all build run test race cover vet fmt tidy clean check smoke
+.PHONY: all build run test race cover vet fmt tidy clean check smoke \
+        cluster cluster-status cluster-kill-leader cluster-stop
 
 all: check build
 
@@ -26,6 +27,22 @@ test:
 ## smoke: exercise a RUNNING node over HTTP (start one first with: make run)
 smoke:
 	@scripts/smoke.sh http://127.0.0.1$(ADDR)
+
+## cluster: start a local three-node cluster on :8181, :8182, :8183
+cluster:
+	@scripts/cluster.sh start
+
+## cluster-status: show each node's role, term, and commit index
+cluster-status:
+	@scripts/cluster.sh status
+
+## cluster-kill-leader: stop the current leader and watch the cluster recover
+cluster-kill-leader:
+	@scripts/cluster.sh kill-leader
+
+## cluster-stop: shut the local cluster down
+cluster-stop:
+	@scripts/cluster.sh stop
 
 ## race: run the unit tests under the race detector
 race:
@@ -55,4 +72,4 @@ check: fmt vet race
 
 ## clean: remove build and coverage artifacts
 clean:
-	rm -rf bin coverage.out coverage.html
+	rm -rf bin coverage.out coverage.html .cluster
