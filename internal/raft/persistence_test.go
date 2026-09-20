@@ -216,3 +216,103 @@ type unreadableStorage struct {
 func (s *unreadableStorage) Load() (HardState, []LogEntry, error) {
 	return HardState{}, nil, s.err
 }
+
+// TestNodeStopsWhenItCannotPersistEntries covers the other half of the
+// storage contract. An entry held in memory but not on disk would vanish on
+// restart after this node had already told a leader it held it.
+func TestNodeStopsWhenItCannotPersistEntries(t *testing.T) {
+	t.Parallel()
+
+	diskFull := errors.New("no space left on device")
+	storage := &appendFailingStorage{fail: diskFull}
+
+	n := nodeWithStorage(t, storage, "n1", "n2")
+	n.becomeCandidate()
+	n.becomeLeader() // appends the term no-op, which cannot be persisted
+
+	if n.Err() == nil {
+		t.Fatal("Err = nil after a failed append; the node carried on unsafely")
+	}
+	if !errors.Is(n.Err(), diskFull) {
+		t.Errorf("Err = %v, want it to wrap %v", n.Err(), diskFull)
+	}
+}
+
+type appendFailingStorage struct {
+	MemoryStorage
+	fail error
+}
+
+func (s *appendFailingStorage) Append([]LogEntry) error { return s.fail }
+
+// TestNodeStopsWhenItCannotTruncate: discarding conflicting entries is a
+// durable operation too, and a failure leaves the log disagreeing with disk.
+func TestNodeStopsWhenItCannotTruncate(t *testing.T) {
+	t.Parallel()
+
+	broken := errors.New("device failure")
+	storage := &truncateFailingStorage{fail: broken}
+
+	n := nodeWithStorage(t, storage, "n1")
+	n.currentTerm = 2
+	n.Step(AppendEntries{
+		Header:  Header{From: "n1", To: "n0", Term: 2},
+		Entries: []LogEntry{{Term: 1, Index: 1}, {Term: 1, Index: 2}},
+	})
+
+	// A leader replaces index 2, which forces a truncation.
+	n.Step(AppendEntries{
+		Header:       Header{From: "n1", To: "n0", Term: 2},
+		PrevLogIndex: 1,
+		PrevLogTerm:  1,
+		Entries:      []LogEntry{{Term: 2, Index: 2, Command: []byte("replacement")}},
+	})
+
+	if !errors.Is(n.Err(), broken) {
+		t.Errorf("Err = %v, want it to wrap %v", n.Err(), broken)
+	}
+}
+
+type truncateFailingStorage struct {
+	MemoryStorage
+	fail error
+}
+
+func (s *truncateFailingStorage) TruncateFrom(Index) error { return s.fail }
+
+// TestCompactStopsTheNodeWhenStorageFails: a snapshot that cannot be persisted
+// must not be treated as installed, or the log would be discarded with nothing
+// to replace it.
+func TestCompactStopsTheNodeWhenStorageFails(t *testing.T) {
+	t.Parallel()
+
+	broken := errors.New("device failure")
+	storage := &snapshotFailingStorage{fail: broken}
+
+	n := nodeWithStorage(t, storage, "n1", "n2")
+	n.becomeCandidate()
+	n.becomeLeader()
+	n.commitIndex = n.lastLogIndex()
+	n.CommittedEntries()
+
+	before := n.LogLength()
+	err := n.Compact(n.LastApplied(), []byte("snapshot"))
+
+	if !errors.Is(err, broken) {
+		t.Errorf("Compact = %v, want it to wrap %v", err, broken)
+	}
+	if n.LogLength() != before {
+		t.Errorf("log length = %d, want %d; entries were discarded despite the snapshot failing",
+			n.LogLength(), before)
+	}
+	if n.SnapshotIndex() != 0 {
+		t.Errorf("SnapshotIndex = %d, want 0", n.SnapshotIndex())
+	}
+}
+
+type snapshotFailingStorage struct {
+	MemoryStorage
+	fail error
+}
+
+func (s *snapshotFailingStorage) SaveSnapshot(SnapshotMeta, []byte) error { return s.fail }

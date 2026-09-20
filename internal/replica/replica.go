@@ -99,6 +99,15 @@ type Config struct {
 	// in-memory one, so the node participates correctly while it runs and
 	// remembers nothing across a restart.
 	Storage raft.Storage
+
+	// SnapshotThreshold is how many uncompacted log entries trigger a
+	// snapshot. Zero disables compaction, which lets the log grow forever.
+	//
+	// The value trades startup time against snapshot cost. A low threshold
+	// snapshots often, so the log stays short and a restart replays little,
+	// but serializing the whole state machine repeatedly is wasted work. A
+	// high one does the opposite.
+	SnapshotThreshold int
 }
 
 // Defaults chosen so that an election completes in well under a second while
@@ -111,6 +120,7 @@ const (
 	defaultHeartbeatInterval  = 2
 	defaultWriteTimeout       = 5 * time.Second
 	defaultReadTimeout        = 2 * time.Second
+	defaultSnapshotThreshold  = 1024
 )
 
 func (c *Config) applyDefaults() {
@@ -132,6 +142,9 @@ func (c *Config) applyDefaults() {
 	if c.ReadTimeout <= 0 {
 		c.ReadTimeout = defaultReadTimeout
 	}
+	if c.SnapshotThreshold == 0 {
+		c.SnapshotThreshold = defaultSnapshotThreshold
+	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -146,6 +159,11 @@ type Status struct {
 	LeaderAddr  string      `json:"leader_addr,omitempty"`
 	CommitIndex uint64      `json:"commit_index"`
 	LastApplied uint64      `json:"last_applied"`
+
+	// SnapshotIndex is the last log index folded into a snapshot, and
+	// LogEntries is how many remain uncompacted.
+	SnapshotIndex uint64 `json:"snapshot_index"`
+	LogEntries    int    `json:"log_entries"`
 }
 
 // Request identifies a client operation so a retry can be recognized as one.
@@ -249,10 +267,21 @@ func New(cfg Config) (*Replica, error) {
 		return nil, fmt.Errorf("replica: %w", err)
 	}
 
+	machine := fsm.New(cfg.Store)
+
+	// A node that loaded a snapshot at startup hands it over here. Installing
+	// it before the loop starts means the state machine and the node's log
+	// position agree from the first request onward.
+	if _, data := node.TakePendingSnapshot(); data != nil {
+		if err := machine.Restore(data); err != nil {
+			return nil, fmt.Errorf("replica: restoring snapshot at startup: %w", err)
+		}
+	}
+
 	return &Replica{
 		cfg:      cfg,
 		node:     node,
-		fsm:      fsm.New(cfg.Store),
+		fsm:      machine,
 		store:    cfg.Store,
 		tr:       cfg.Transport,
 		logger:   cfg.Logger,
@@ -336,8 +365,15 @@ func (r *Replica) dispatch(msgs []raft.Message) {
 		r.tr.Send(msg)
 	}
 
+	// A snapshot received from the leader replaces the state machine outright,
+	// and must be installed before any committed entry is applied on top of
+	// it. Applying first would run entries against state the snapshot is about
+	// to discard.
+	r.installPendingSnapshot()
+
 	r.applyCommitted()
 	r.resolveReads()
+	r.maybeSnapshot()
 
 	// A node that is no longer leader cannot know whether its uncommitted
 	// entries will survive. Failing the clients now is the honest answer: they
@@ -368,6 +404,79 @@ func (r *Replica) applyCommitted() {
 		}
 		r.resolve(entry, err)
 	}
+}
+
+// installPendingSnapshot replaces the state machine with a snapshot the node
+// accepted from a leader.
+func (r *Replica) installPendingSnapshot() {
+	meta, data := r.node.TakePendingSnapshot()
+	if data == nil {
+		return
+	}
+
+	if err := r.fsm.Restore(data); err != nil {
+		// The node's log position now claims state the machine does not hold.
+		// Continuing would answer reads from the wrong data, so the replica
+		// stops instead.
+		r.logger.Error("restoring a received snapshot failed, node is stopping",
+			slog.Uint64("index", uint64(meta.Index)),
+			slog.Any("error", err),
+		)
+		r.storageErr = err
+		return
+	}
+
+	// Writes that were waiting cannot be resolved from a snapshot: it says
+	// what the state is, not which proposals produced it. They are failed so
+	// the clients retry rather than wait forever.
+	if len(r.pending) > 0 {
+		r.failPending(raft.ErrNotLeader)
+	}
+
+	r.logger.Info("installed snapshot from leader",
+		slog.Uint64("index", uint64(meta.Index)),
+		slog.Uint64("term", uint64(meta.Term)),
+	)
+}
+
+// maybeSnapshot compacts the log once it has grown past the threshold.
+func (r *Replica) maybeSnapshot() {
+	if r.cfg.SnapshotThreshold <= 0 || r.node.LogLength() < r.cfg.SnapshotThreshold {
+		return
+	}
+
+	applied := r.node.LastApplied()
+	if applied <= r.node.SnapshotIndex() {
+		return // nothing new has been applied since the last snapshot
+	}
+
+	// The snapshot is taken at lastApplied rather than the commit index. An
+	// entry that is committed but not yet applied is not reflected in the
+	// state machine, so a snapshot claiming to cover it would silently lose
+	// its effect.
+	data, err := r.fsm.Snapshot()
+	if err != nil {
+		r.logger.Error("taking a snapshot failed, log compaction skipped",
+			slog.Any("error", err))
+
+		// Disable further attempts rather than retrying on every apply, which
+		// would turn one failure into a flood of identical log lines.
+		r.cfg.SnapshotThreshold = 0
+		return
+	}
+
+	if err := r.node.Compact(applied, data); err != nil {
+		r.logger.Error("compacting the log failed",
+			slog.Uint64("index", uint64(applied)),
+			slog.Any("error", err))
+		return
+	}
+
+	r.logger.Info("compacted log",
+		slog.Uint64("index", uint64(applied)),
+		slog.Int("bytes", len(data)),
+		slog.Int("entries_remaining", r.node.LogLength()),
+	)
 }
 
 // resolve completes the client write waiting on an entry, if any.
@@ -406,6 +515,11 @@ func (r *Replica) propose(p proposal) {
 	// A single-node cluster commits on append, so the entry may already be
 	// ready to apply.
 	r.applyCommitted()
+
+	// Checked here as well as on each tick, because the log grows on append.
+	// Relying on ticks alone would let a burst of writes run between two of
+	// them and leave the log arbitrarily long in the meantime.
+	r.maybeSnapshot()
 }
 
 // registerRead opens a read barrier and records the client waiting on it.
@@ -477,6 +591,9 @@ func (r *Replica) status() Status {
 		LeaderAddr:  r.cfg.ClientAddrs[leader],
 		CommitIndex: uint64(r.node.CommitIndex()),
 		LastApplied: uint64(r.node.LastApplied()),
+
+		SnapshotIndex: uint64(r.node.SnapshotIndex()),
+		LogEntries:    r.node.LogLength(),
 	}
 }
 

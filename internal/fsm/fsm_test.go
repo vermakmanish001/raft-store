@@ -452,3 +452,148 @@ func TestEvictionKeepsRecentClients(t *testing.T) {
 		t.Errorf("x = %q, want %q; a recent client's retry was not deduplicated", got, "d")
 	}
 }
+
+// TestSnapshotRoundTrip covers the whole state machine, including the part
+// most implementations forget.
+func TestSnapshotRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	original := store.New()
+	f := fsm.New(original)
+
+	applyCmd(t, f, 1, fsm.Command{Op: fsm.OpPut, Key: "a", Value: "1", ClientID: "client-a", Seq: 1})
+	applyCmd(t, f, 2, fsm.Command{Op: fsm.OpPut, Key: "b", Value: "2", ClientID: "client-b", Seq: 1})
+	applyCmd(t, f, 3, fsm.Command{Op: fsm.OpDelete, Key: "a", ClientID: "client-a", Seq: 2})
+
+	data, err := f.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	// A different node restores it into an empty store.
+	restoredStore := store.New()
+	restored := fsm.New(restoredStore)
+	if err := restored.Restore(data); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	if got, err := restoredStore.Get("b"); err != nil || got != "2" {
+		t.Errorf("b = %q, %v; want %q, nil", got, err, "2")
+	}
+	if _, err := restoredStore.Get("a"); !errors.Is(err, store.ErrKeyNotFound) {
+		t.Errorf("a = %v, want %v; the deletion must be captured too", err, store.ErrKeyNotFound)
+	}
+	if got := restored.Sessions(); got != 2 {
+		t.Errorf("Sessions = %d, want 2", got)
+	}
+}
+
+// TestSnapshotPreservesDeduplication is the bug this test exists to catch.
+//
+// A snapshot that omits the session table restores a node which has forgotten
+// which client requests it already applied. Deduplication then holds right up
+// until the first snapshot and silently stops, which is far worse than never
+// having had it.
+func TestSnapshotPreservesDeduplication(t *testing.T) {
+	t.Parallel()
+
+	source := fsm.New(store.New())
+	applyCmd(t, source, 1, fsm.Command{Op: fsm.OpPut, Key: "x", Value: "from A", ClientID: "client-a", Seq: 1})
+	applyCmd(t, source, 2, fsm.Command{Op: fsm.OpPut, Key: "x", Value: "from B", ClientID: "client-b", Seq: 1})
+
+	data, err := source.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	// A node restored from that snapshot receives A's retry.
+	st := store.New()
+	restored := fsm.New(st)
+	if err := restored.Restore(data); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	applyCmd(t, restored, 3, fsm.Command{Op: fsm.OpPut, Key: "x", Value: "from A", ClientID: "client-a", Seq: 1})
+
+	if got, _ := st.Get("x"); got != "from B" {
+		t.Errorf("x = %q, want %q; the restored node re-applied a request it had already answered",
+			got, "from B")
+	}
+}
+
+// TestSnapshotPreservesEvictionOrder: the apply counter orders eviction, so
+// losing it would make a restored replica evict different clients from its
+// peers and drift apart from them.
+func TestSnapshotPreservesEvictionOrder(t *testing.T) {
+	t.Parallel()
+
+	source := fsm.New(store.New(), fsm.WithMaxSessions(4))
+	for i := range 3 {
+		applyCmd(t, source, uint64(i+1), fsm.Command{
+			Op: fsm.OpPut, Key: "k", Value: "v", ClientID: clientName(i), Seq: 1,
+		})
+	}
+
+	data, err := source.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	restored := fsm.New(store.New(), fsm.WithMaxSessions(4))
+	if err := restored.Restore(data); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	// Both continue from the same point with the same further commands.
+	extend := func(f *fsm.FSM) int {
+		for i := 3; i < 10; i++ {
+			applyCmd(t, f, uint64(i+1), fsm.Command{
+				Op: fsm.OpPut, Key: "k", Value: "v", ClientID: clientName(i), Seq: 1,
+			})
+		}
+		return f.Sessions()
+	}
+
+	if a, b := extend(source), extend(restored); a != b {
+		t.Errorf("session counts diverged after restore: source %d, restored %d", a, b)
+	}
+}
+
+func TestRestoreRejectsGarbage(t *testing.T) {
+	t.Parallel()
+
+	f := fsm.New(store.New())
+	if err := f.Restore([]byte("not a snapshot")); err == nil {
+		t.Error("Restore accepted garbage, want an error")
+	}
+}
+
+// TestRestoreReplacesRatherThanMerges: a snapshot describes complete state, so
+// keys deleted before it must not survive the restore.
+func TestRestoreReplacesRatherThanMerges(t *testing.T) {
+	t.Parallel()
+
+	source := fsm.New(store.New())
+	applyCmd(t, source, 1, fsm.Command{Op: fsm.OpPut, Key: "kept", Value: "1"})
+	data, err := source.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	// The target already holds a key the snapshot does not mention.
+	st := store.New()
+	if err := st.Put("stale", "should not survive"); err != nil {
+		t.Fatalf("seeding: %v", err)
+	}
+
+	if err := fsm.New(st).Restore(data); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	if _, err := st.Get("stale"); !errors.Is(err, store.ErrKeyNotFound) {
+		t.Errorf("stale key survived the restore: %v; this replica now disagrees with its peers", err)
+	}
+	if got, _ := st.Get("kept"); got != "1" {
+		t.Errorf("kept = %q, want %q", got, "1")
+	}
+}

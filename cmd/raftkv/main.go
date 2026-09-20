@@ -50,6 +50,7 @@ func run() error {
 		peerSpec  = flag.String("peers", "", "other nodes, as id=url[,id=url...]")
 		advertise = flag.String("advertise", "", "base URL peers and clients use to reach this node")
 		dataDir   = flag.String("data-dir", "", "directory for the write-ahead log; empty means state is kept in memory and lost on restart")
+		snapEvery = flag.Int("snapshot-threshold", 1024, "compact the log once this many uncompacted entries accumulate; 0 disables compaction")
 		logLevel  = flag.String("log-level", "info", "log verbosity: debug, info, warn, error")
 		logJSON   = flag.Bool("log-json", false, "emit logs as JSON instead of text")
 	)
@@ -108,6 +109,8 @@ func run() error {
 		Store:       store.New(),
 		Storage:     storage,
 		Logger:      logger,
+
+		SnapshotThreshold: *snapEvery,
 	})
 	if err != nil {
 		return err

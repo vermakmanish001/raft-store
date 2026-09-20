@@ -23,6 +23,8 @@ const (
 	tagRequestVoteResponse  = "request_vote_response"
 	tagAppendEntries        = "append_entries"
 	tagAppendEntriesRespons = "append_entries_response"
+	tagInstallSnapshot      = "install_snapshot"
+	tagInstallSnapshotResp  = "install_snapshot_response"
 )
 
 // ErrUnknownMessage reports a wire message this build does not recognize.
@@ -47,6 +49,10 @@ func Encode(msg raft.Message) ([]byte, error) {
 		tag = tagAppendEntries
 	case raft.AppendEntriesResponse:
 		tag = tagAppendEntriesRespons
+	case raft.InstallSnapshot:
+		tag = tagInstallSnapshot
+	case raft.InstallSnapshotResponse:
+		tag = tagInstallSnapshotResp
 	default:
 		return nil, fmt.Errorf("%w: %T", ErrUnknownMessage, msg)
 	}
@@ -84,6 +90,10 @@ func Decode(data []byte) (raft.Message, error) {
 		return decodeInto[raft.AppendEntries](env)
 	case tagAppendEntriesRespons:
 		return decodeInto[raft.AppendEntriesResponse](env)
+	case tagInstallSnapshot:
+		return decodeInto[raft.InstallSnapshot](env)
+	case tagInstallSnapshotResp:
+		return decodeInto[raft.InstallSnapshotResponse](env)
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnknownMessage, env.Type)
 	}

@@ -14,13 +14,16 @@ package raft
 func (n *Node) broadcastAppend() []Message {
 	msgs := make([]Message, 0, len(n.peers))
 	for _, peer := range n.peers {
-		msgs = append(msgs, n.appendTo(peer))
+		if msg := n.appendTo(peer); msg != nil {
+			msgs = append(msgs, msg)
+		}
 	}
 	return msgs
 }
 
-// appendTo builds the AppendEntries destined for one peer.
-func (n *Node) appendTo(peer NodeID) AppendEntries {
+// appendTo builds the message destined for one peer, which is a snapshot when
+// the entries that peer needs have already been compacted away.
+func (n *Node) appendTo(peer NodeID) Message {
 	next := n.nextIndex[peer]
 	if next == 0 {
 		// Defensive: nextIndex is 1-based, so 0 means the entry is missing
@@ -30,6 +33,14 @@ func (n *Node) appendTo(peer NodeID) AppendEntries {
 	}
 
 	prevIndex := next - 1
+
+	// The follower needs entries this leader no longer holds. Ordinary
+	// repair walks nextIndex backward until the logs agree, but there is
+	// nothing to walk back to once the prefix is inside a snapshot, so the
+	// snapshot is sent instead.
+	if prevIndex < n.snapshotIndex {
+		return n.snapshotTo(peer)
+	}
 
 	return AppendEntries{
 		Header:       Header{From: n.id, To: peer, Term: n.currentTerm},
@@ -172,7 +183,10 @@ func (n *Node) handleAppendEntriesResponse(m AppendEntriesResponse) []Message {
 		// Retry immediately rather than waiting for the next heartbeat. A
 		// follower that is far behind would otherwise need one full heartbeat
 		// interval per round of backtracking.
-		return []Message{n.appendTo(m.From)}
+		if msg := n.appendTo(m.From); msg != nil {
+			return []Message{msg}
+		}
+		return nil
 	}
 
 	// Responses can arrive out of order, and an older one carries a smaller

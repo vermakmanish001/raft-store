@@ -276,3 +276,100 @@ func (f *FSM) evictIfNeeded() {
 
 // Sessions returns how many clients are currently remembered.
 func (f *FSM) Sessions() int { return len(f.sessions) }
+
+// Snapshotter is a store that can export and replace its entire contents.
+//
+// The capability is declared here, where it is used, rather than in
+// store.Store. A store that cannot enumerate itself is still a perfectly good
+// store; it just cannot back a compacting replica.
+type Snapshotter interface {
+	Snapshot() map[string]string
+	Restore(map[string]string)
+}
+
+// ErrNotSnapshotable reports a store that cannot be captured.
+var ErrNotSnapshotable = errors.New("fsm: store does not support snapshots")
+
+// snapshot is the serialized form of everything the state machine holds.
+type snapshot struct {
+	Data []byte `json:"-"`
+
+	KV       map[string]string          `json:"kv"`
+	Sessions map[string]sessionSnapshot `json:"sessions"`
+	Applied  uint64                     `json:"applied"`
+}
+
+// sessionSnapshot mirrors session in a form that survives serialization.
+type sessionSnapshot struct {
+	LastSeq    uint64 `json:"last_seq"`
+	LastResult uint8  `json:"last_result"`
+	UsedAt     uint64 `json:"used_at"`
+}
+
+// Snapshot serializes the state machine.
+//
+// The session table is included alongside the key-value data, and leaving it
+// out would be a silent correctness bug rather than an optimization. A node
+// restored from a snapshot without it has forgotten which client requests it
+// already applied, so the next retry of an in-flight request applies a second
+// time. The deduplication guarantee would hold right up until the first
+// snapshot and then quietly stop.
+//
+// The apply counter is included too, because it orders session eviction. A
+// replica that restored a zeroed counter would evict different clients from
+// its peers and they would drift apart.
+func (f *FSM) Snapshot() ([]byte, error) {
+	snapshotter, ok := f.store.(Snapshotter)
+	if !ok {
+		return nil, ErrNotSnapshotable
+	}
+
+	sessions := make(map[string]sessionSnapshot, len(f.sessions))
+	for id, s := range f.sessions {
+		sessions[id] = sessionSnapshot{
+			LastSeq:    s.lastSeq,
+			LastResult: uint8(s.lastResult),
+			UsedAt:     s.usedAt,
+		}
+	}
+
+	data, err := json.Marshal(snapshot{
+		KV:       snapshotter.Snapshot(),
+		Sessions: sessions,
+		Applied:  f.applied,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("fsm: encoding snapshot: %w", err)
+	}
+	return data, nil
+}
+
+// Restore replaces the state machine's contents from a snapshot.
+func (f *FSM) Restore(data []byte) error {
+	snapshotter, ok := f.store.(Snapshotter)
+	if !ok {
+		return ErrNotSnapshotable
+	}
+
+	var snap snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return fmt.Errorf("fsm: decoding snapshot: %w", err)
+	}
+
+	if snap.KV == nil {
+		snap.KV = map[string]string{}
+	}
+	snapshotter.Restore(snap.KV)
+
+	f.sessions = make(map[string]session, len(snap.Sessions))
+	for id, s := range snap.Sessions {
+		f.sessions[id] = session{
+			lastSeq:    s.LastSeq,
+			lastResult: resultCode(s.LastResult),
+			usedAt:     s.UsedAt,
+		}
+	}
+	f.applied = snap.Applied
+
+	return nil
+}

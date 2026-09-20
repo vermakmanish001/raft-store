@@ -45,6 +45,13 @@ func (n *memNet) isolate(id raft.NodeID) {
 	n.down[id] = true
 }
 
+// heal reconnects every isolated node.
+func (n *memNet) heal() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.down = make(map[raft.NodeID]bool)
+}
+
 // isDown reads partition state under the lock. Replica goroutines read the
 // same map concurrently, so the test must not peek at it directly.
 func (n *memNet) isDown(id raft.NodeID) bool {
@@ -701,5 +708,344 @@ func TestReadAfterFailoverSeesCommittedWrites(t *testing.T) {
 	}
 	if got != "committed before failover" {
 		t.Errorf("x = %q, want the value committed before the old leader failed", got)
+	}
+}
+
+// newCompactingCluster builds a cluster that snapshots aggressively, so a test
+// reaches compaction in a handful of writes rather than a thousand.
+func newCompactingCluster(t *testing.T, size, threshold int) *testCluster {
+	t.Helper()
+
+	ids := make([]raft.NodeID, size)
+	for i := range size {
+		ids[i] = raft.NodeID(fmt.Sprintf("n%d", i))
+	}
+
+	c := &testCluster{
+		t:        t,
+		net:      newMemNet(),
+		replicas: make(map[raft.NodeID]*replica.Replica, size),
+		ids:      ids,
+	}
+
+	for _, id := range ids {
+		peers := make([]raft.NodeID, 0, size-1)
+		for _, other := range ids {
+			if other != id {
+				peers = append(peers, other)
+			}
+		}
+
+		r, err := replica.New(replica.Config{
+			ID:                 id,
+			Peers:              peers,
+			Transport:          c.net.transport(id),
+			Store:              store.New(),
+			TickInterval:       5 * time.Millisecond,
+			ElectionTimeoutMin: 8,
+			ElectionTimeoutMax: 16,
+			HeartbeatInterval:  1,
+			WriteTimeout:       3 * time.Second,
+			ReadTimeout:        1 * time.Second,
+			SnapshotThreshold:  threshold,
+		})
+		if err != nil {
+			t.Fatalf("replica.New(%s): %v", id, err)
+		}
+		c.replicas[id] = r
+		r.Start()
+	}
+
+	t.Cleanup(func() {
+		for _, r := range c.replicas {
+			r.Close()
+		}
+	})
+	return c
+}
+
+// TestLogStaysBounded is the point of compaction: without it, a long-running
+// cluster replays an ever-longer log at startup.
+func TestLogStaysBounded(t *testing.T) {
+	t.Parallel()
+
+	c := newCompactingCluster(t, 3, 10)
+	leader := c.leader()
+
+	for i := range 80 {
+		if err := leader.Put(fmt.Sprintf("key-%d", i), "value"); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+
+	status := leader.Status()
+	if status.SnapshotIndex == 0 {
+		t.Fatalf("no snapshot was ever taken after 80 writes: %+v", status)
+	}
+	if status.LogEntries > 40 {
+		t.Errorf("log holds %d entries after 80 writes with a threshold of 10; "+
+			"compaction is not keeping up", status.LogEntries)
+	}
+
+	// Compaction must not cost any data.
+	for i := range 80 {
+		got, err := leader.Get(fmt.Sprintf("key-%d", i))
+		if err != nil || got != "value" {
+			t.Fatalf("key-%d = %q, %v after compaction; want the value intact", i, got, err)
+		}
+	}
+}
+
+// TestLaggingFollowerCatchesUpViaSnapshot is why InstallSnapshot exists. The
+// ordinary repair path walks a follower backward until the logs agree, which
+// is impossible once the entries it needs have been compacted away.
+func TestLaggingFollowerCatchesUpViaSnapshot(t *testing.T) {
+	t.Parallel()
+
+	c := newCompactingCluster(t, 3, 10)
+	leader := c.leader()
+
+	// Cut off a follower, not the leader, so the cluster keeps making progress.
+	var lagging raft.NodeID
+	for _, id := range c.ids {
+		if id != leader.Status().ID {
+			lagging = id
+			break
+		}
+	}
+	c.net.isolate(lagging)
+
+	for i := range 60 {
+		if err := leader.Put(fmt.Sprintf("key-%d", i), "value"); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+
+	snapshotIndex := leader.Status().SnapshotIndex
+	if snapshotIndex == 0 {
+		t.Fatal("the leader never compacted, so no snapshot transfer can be exercised")
+	}
+	if behind := c.replicas[lagging].Status().LastApplied; behind >= snapshotIndex {
+		t.Fatalf("the isolated node is at %d and the snapshot is at %d; "+
+			"it did not fall behind the compacted prefix", behind, snapshotIndex)
+	}
+
+	c.net.heal()
+
+	// It cannot be repaired entry by entry, so it must receive a snapshot.
+	if !eventually(10*time.Second, func() bool {
+		return c.replicas[lagging].Status().LastApplied >= leader.Status().CommitIndex
+	}) {
+		t.Fatalf("the lagging node never caught up\n%s", c.dump())
+	}
+
+	if got := c.replicas[lagging].Status().SnapshotIndex; got == 0 {
+		t.Error("the lagging node caught up without installing a snapshot, " +
+			"which should have been impossible")
+	}
+}
+
+// TestRestartAfterCompaction: a node that restarts must rebuild its state
+// machine from the snapshot, since the entries that produced it are gone.
+func TestRestartAfterCompaction(t *testing.T) {
+	t.Parallel()
+
+	storage := raft.NewMemoryStorage()
+	net := newMemNet()
+
+	build := func() *replica.Replica {
+		r, err := replica.New(replica.Config{
+			ID:                 "n0",
+			Transport:          net.transport("n0"),
+			Store:              store.New(), // fresh: must be rebuilt from the snapshot
+			Storage:            storage,
+			TickInterval:       5 * time.Millisecond,
+			ElectionTimeoutMin: 4,
+			ElectionTimeoutMax: 8,
+			HeartbeatInterval:  1,
+			WriteTimeout:       3 * time.Second,
+			ReadTimeout:        1 * time.Second,
+			SnapshotThreshold:  5,
+		})
+		if err != nil {
+			t.Fatalf("replica.New: %v", err)
+		}
+		r.Start()
+		return r
+	}
+
+	first := build()
+	if !eventually(3*time.Second, func() bool { return first.Status().Role == "leader" }) {
+		t.Fatal("no leader")
+	}
+
+	for i := range 40 {
+		if err := first.Put(fmt.Sprintf("key-%d", i), "value"); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+	if first.Status().SnapshotIndex == 0 {
+		t.Fatal("no snapshot was taken, so the restart would not exercise restoration")
+	}
+	first.Close()
+
+	second := build()
+	t.Cleanup(func() { second.Close() })
+
+	if !eventually(3*time.Second, func() bool { return second.Status().Role == "leader" }) {
+		t.Fatalf("restarted replica never became leader: %+v", second.Status())
+	}
+
+	for i := range 40 {
+		key := fmt.Sprintf("key-%d", i)
+		var got string
+		if !eventually(3*time.Second, func() bool {
+			v, err := second.Get(key)
+			got = v
+			return err == nil && v == "value"
+		}) {
+			t.Fatalf("%s = %q after restart, want the value rebuilt from the snapshot", key, got)
+		}
+	}
+}
+
+// TestDeduplicationSurvivesSnapshotTransfer is the bug most implementations
+// ship: a snapshot that omits the session table leaves the receiving node
+// having forgotten which requests it already applied.
+func TestDeduplicationSurvivesSnapshotTransfer(t *testing.T) {
+	t.Parallel()
+
+	c := newCompactingCluster(t, 3, 10)
+	leader := c.leader()
+
+	req := replica.Request{ClientID: "client-a", Seq: 1}
+	if err := leader.PutRequest("x", "from A", req); err != nil {
+		t.Fatalf("A's write: %v", err)
+	}
+
+	// Enough traffic to force compaction past that write.
+	for i := range 60 {
+		if err := leader.Put(fmt.Sprintf("filler-%d", i), "v"); err != nil {
+			t.Fatalf("filler %d: %v", i, err)
+		}
+	}
+	if leader.Status().SnapshotIndex == 0 {
+		t.Fatal("no snapshot was taken")
+	}
+
+	// Another client overwrites the key.
+	if err := leader.PutRequest("x", "from B", replica.Request{ClientID: "client-b", Seq: 1}); err != nil {
+		t.Fatalf("B's write: %v", err)
+	}
+
+	// A's retry arrives after its original was folded into a snapshot.
+	if err := leader.PutRequest("x", "from A", req); err != nil {
+		t.Fatalf("A's retry: %v", err)
+	}
+
+	got, err := leader.Get("x")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got != "from B" {
+		t.Errorf("x = %q, want %q; the session table was lost across compaction, "+
+			"so deduplication silently stopped working", got, "from B")
+	}
+}
+
+// TestDeleteOfAbsentKeyReachesTheClient: an apply outcome that every replica
+// reproduces identically is a result to report, not a fault to log.
+func TestDeleteOfAbsentKeyReachesTheClient(t *testing.T) {
+	t.Parallel()
+
+	c := newTestCluster(t, 3)
+	leader := c.leader()
+
+	err := leader.Delete("never-existed")
+	if !errors.Is(err, store.ErrKeyNotFound) {
+		t.Errorf("Delete = %v, want %v", err, store.ErrKeyNotFound)
+	}
+
+	// The replica must still be healthy: this was a result, not a failure.
+	if leader.Status().Role != "leader" {
+		t.Errorf("role = %q, want leader; a deterministic client error must not stop the node",
+			leader.Status().Role)
+	}
+	if err := leader.Put("after", "value"); err != nil {
+		t.Errorf("Put after a client error: %v", err)
+	}
+}
+
+// unsnapshotableStore satisfies store.Store but cannot enumerate itself, which
+// is what a compacting replica needs.
+type unsnapshotableStore struct{ inner *store.MemStore }
+
+func (s unsnapshotableStore) Get(k string) (string, error) { return s.inner.Get(k) }
+func (s unsnapshotableStore) Put(k, v string) error        { return s.inner.Put(k, v) }
+func (s unsnapshotableStore) Delete(k string) error        { return s.inner.Delete(k) }
+
+// TestCompactionDisabledWhenSnapshotsAreUnsupported: a store that cannot be
+// captured must leave the replica serving rather than failing every write.
+func TestCompactionDisabledWhenSnapshotsAreUnsupported(t *testing.T) {
+	t.Parallel()
+
+	net := newMemNet()
+	r, err := replica.New(replica.Config{
+		ID:                 "n0",
+		Transport:          net.transport("n0"),
+		Store:              unsnapshotableStore{inner: store.New()},
+		TickInterval:       5 * time.Millisecond,
+		ElectionTimeoutMin: 4,
+		ElectionTimeoutMax: 8,
+		HeartbeatInterval:  1,
+		WriteTimeout:       3 * time.Second,
+		ReadTimeout:        1 * time.Second,
+		SnapshotThreshold:  3,
+	})
+	if err != nil {
+		t.Fatalf("replica.New: %v", err)
+	}
+	r.Start()
+	t.Cleanup(func() { r.Close() })
+
+	if !eventually(3*time.Second, func() bool { return r.Status().Role == "leader" }) {
+		t.Fatal("no leader")
+	}
+
+	// Well past the threshold. Every attempt to snapshot fails, and the
+	// replica must keep serving regardless.
+	for i := range 20 {
+		if err := r.Put(fmt.Sprintf("key-%d", i), "value"); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+
+	if got, err := r.Get("key-19"); err != nil || got != "value" {
+		t.Errorf("key-19 = %q, %v; want the replica still serving", got, err)
+	}
+	if got := r.Status().SnapshotIndex; got != 0 {
+		t.Errorf("SnapshotIndex = %d, want 0; nothing should have been compacted", got)
+	}
+}
+
+// TestSnapshotThresholdZeroDisablesCompaction.
+func TestSnapshotThresholdZeroDisablesCompaction(t *testing.T) {
+	t.Parallel()
+
+	c := newCompactingCluster(t, 1, -1) // negative disables, unlike zero which defaults
+	leader := c.leader()
+
+	for i := range 30 {
+		if err := leader.Put(fmt.Sprintf("key-%d", i), "v"); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+
+	status := leader.Status()
+	if status.SnapshotIndex != 0 {
+		t.Errorf("SnapshotIndex = %d, want 0 with compaction disabled", status.SnapshotIndex)
+	}
+	if status.LogEntries < 30 {
+		t.Errorf("LogEntries = %d, want the log to have grown unchecked", status.LogEntries)
 	}
 }

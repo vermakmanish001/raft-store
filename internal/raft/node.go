@@ -104,6 +104,17 @@ type Node struct {
 	votedFor    NodeID // empty means no vote cast in currentTerm
 	log         []LogEntry
 
+	// snapshotIndex and snapshotTerm describe the last entry folded into the
+	// most recent snapshot. Entries at or below snapshotIndex are no longer in
+	// the log, so every index calculation consults these. See log.go.
+	snapshotIndex Index
+	snapshotTerm  Term
+
+	// pendingSnapshot holds a snapshot the caller must install into its state
+	// machine, set either at startup from storage or on receiving one from a
+	// leader. It is drained by TakePendingSnapshot.
+	pendingSnapshot []byte
+
 	// Volatile state.
 	role     Role
 	leaderID NodeID // best known leader for currentTerm, empty if unknown
@@ -192,6 +203,11 @@ func NewNode(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("raft: loading persisted state: %w", err)
 	}
 
+	snapMeta, snapData, err := storage.LoadSnapshot()
+	if err != nil {
+		return nil, fmt.Errorf("raft: loading snapshot: %w", err)
+	}
+
 	n := &Node{
 		id:    cfg.ID,
 		peers: append([]NodeID(nil), cfg.Peers...), // copy, so the caller cannot mutate membership behind our back
@@ -205,9 +221,25 @@ func NewNode(cfg Config) (*Node, error) {
 		votedFor:    hard.VotedFor,
 		log:         entries,
 
+		snapshotIndex: snapMeta.Index,
+		snapshotTerm:  snapMeta.Term,
+
+		// Everything a snapshot covers was committed before it was taken, and
+		// was applied to produce it. Starting below this point would make the
+		// node re-apply entries it no longer holds, which it cannot do, and
+		// would report a commit index behind what it has actually durably
+		// agreed to.
+		commitIndex: snapMeta.Index,
+		lastApplied: snapMeta.Index,
+
 		storage: storage,
 		cfg:     cfg,
 		rand:    rng,
+	}
+
+	// The caller installs this into its state machine before serving anything.
+	if !snapMeta.IsEmpty() {
+		n.pendingSnapshot = snapData
 	}
 
 	// A restarting node always begins as a follower, whatever it was before.
@@ -216,6 +248,69 @@ func NewNode(cfg Config) (*Node, error) {
 	// that legitimately holds a later term.
 	n.resetElectionTimer()
 	return n, nil
+}
+
+// TakePendingSnapshot returns a snapshot the caller must install into its
+// state machine, along with the log position it covers. It returns nil data
+// when there is nothing to install.
+//
+// The snapshot is handed over exactly once. A caller that drops it would leave
+// a state machine describing a different log position than the node believes,
+// and every subsequent read would answer from the wrong state.
+func (n *Node) TakePendingSnapshot() (SnapshotMeta, []byte) {
+	if n.pendingSnapshot == nil {
+		return SnapshotMeta{}, nil
+	}
+
+	data := n.pendingSnapshot
+	n.pendingSnapshot = nil
+	return SnapshotMeta{Index: n.snapshotIndex, Term: n.snapshotTerm}, data
+}
+
+// SnapshotIndex returns the last log index covered by a snapshot.
+func (n *Node) SnapshotIndex() Index { return n.snapshotIndex }
+
+// LogLength returns how many entries are still held outside the snapshot,
+// which is what a caller watches to decide when to compact.
+func (n *Node) LogLength() int { return len(n.log) }
+
+// Compact discards every log entry covered by a snapshot of the state machine
+// taken at the given index.
+//
+// The index must not exceed lastApplied. Compacting past what the state
+// machine has applied would discard entries whose effects are in neither the
+// log nor the snapshot, leaving that state recoverable from nowhere.
+func (n *Node) Compact(index Index, data []byte) error {
+	if n.fatal != nil {
+		return n.fatal
+	}
+	if index <= n.snapshotIndex {
+		return nil // already covered by an existing snapshot
+	}
+	if index > n.lastApplied {
+		return fmt.Errorf("raft: cannot compact to index %d, the state machine has only applied %d",
+			index, n.lastApplied)
+	}
+
+	term := n.termAt(index)
+	if term == 0 {
+		return fmt.Errorf("raft: cannot compact to index %d, which is not in the log", index)
+	}
+
+	meta := SnapshotMeta{Index: index, Term: term}
+
+	// Storage writes the snapshot before discarding anything. A crash in the
+	// other order would leave neither the entries nor the snapshot replacing
+	// them.
+	if err := n.storage.SaveSnapshot(meta, data); err != nil {
+		n.setFatal(fmt.Errorf("raft: persisting snapshot at index %d: %w", index, err))
+		return n.fatal
+	}
+
+	n.log = n.entriesFrom(index + 1)
+	n.snapshotIndex = meta.Index
+	n.snapshotTerm = meta.Term
+	return nil
 }
 
 // Err returns the failure that stopped this node, or nil.
@@ -319,10 +414,11 @@ func (n *Node) Step(msg Message) []Message {
 		// Carrying votedFor across terms would let one node vote for two
 		// different candidates in the same term and elect two leaders.
 		leader := NodeID("")
-		if ae, ok := msg.(AppendEntries); ok {
-			// Only AppendEntries identifies a leader. A RequestVote at a
-			// higher term means an election is underway, not decided.
-			leader = ae.From
+		switch msg.(type) {
+		case AppendEntries, InstallSnapshot:
+			// Both come only from a leader. A RequestVote at a higher term
+			// means an election is underway, not decided.
+			leader = h.From
 		}
 		n.becomeFollower(h.Term, leader)
 	}
@@ -342,6 +438,13 @@ func (n *Node) Step(msg Message) []Message {
 				Header:  Header{From: n.id, To: h.From, Term: n.currentTerm},
 				Success: false,
 			}}
+		case InstallSnapshot:
+			// Answering with this node's term is what tells a stale leader to
+			// step down. Silently dropping it would leave that leader
+			// retransmitting a large snapshot indefinitely.
+			return []Message{InstallSnapshotResponse{
+				Header: Header{From: n.id, To: h.From, Term: n.currentTerm},
+			}}
 		default:
 			return nil
 		}
@@ -356,6 +459,10 @@ func (n *Node) Step(msg Message) []Message {
 		return n.handleAppendEntries(m)
 	case AppendEntriesResponse:
 		return n.handleAppendEntriesResponse(m)
+	case InstallSnapshot:
+		return n.handleInstallSnapshot(m)
+	case InstallSnapshotResponse:
+		return n.handleInstallSnapshotResponse(m)
 	default:
 		return nil
 	}

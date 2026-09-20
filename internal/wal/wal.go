@@ -72,6 +72,14 @@ type WAL struct {
 	// truncatedRecord records that a partial record was discarded at open,
 	// which is normal after a crash and worth reporting once.
 	truncatedRecord bool
+
+	// state caches the latest hard state so a log rewrite can carry it across
+	// without replaying to find it.
+	state raft.HardState
+
+	// snapMeta describes the installed snapshot, and is what Load consults to
+	// discard entries the snapshot already covers.
+	snapMeta raft.SnapshotMeta
 }
 
 var _ raft.Storage = (*WAL)(nil)
@@ -174,10 +182,17 @@ type truncateRecord struct {
 
 // SaveHardState durably records the term and vote.
 func (w *WAL) SaveHardState(hs raft.HardState) error {
-	return w.appendRecord(recHardState, hardStateRecord{
+	if err := w.appendRecord(recHardState, hardStateRecord{
 		Term:     uint64(hs.Term),
 		VotedFor: string(hs.VotedFor),
-	})
+	}); err != nil {
+		return err
+	}
+
+	w.mu.Lock()
+	w.state = hs
+	w.mu.Unlock()
+	return nil
 }
 
 // Append durably adds entries to the log.
@@ -262,17 +277,38 @@ func (w *WAL) syncLocked() error {
 	return nil
 }
 
-// Load replays the file and returns the reconstructed state.
-//
 // A partial record at the very end is discarded and the file truncated to the
 // last complete one. That is the expected outcome of a crash during a write,
 // not an error: the record was never acknowledged to anyone, so losing it
 // costs nothing. Damage anywhere earlier is reported, because it means a
 // record that was acknowledged can no longer be trusted.
+// Load returns the persisted term, vote, and the log entries that follow the
+// most recent snapshot.
 func (w *WAL) Load() (raft.HardState, []raft.LogEntry, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	meta, _, err := w.loadSnapshotLocked()
+	if err != nil {
+		return raft.HardState{}, nil, err
+	}
+	w.snapMeta = meta
+
+	state, entries, err := w.replayLocked()
+	if err != nil {
+		return raft.HardState{}, nil, err
+	}
+	w.state = state
+
+	// Entries the snapshot already covers are dropped here rather than
+	// relying on the rewrite having happened, which it may not have if the
+	// process died between installing the snapshot and reclaiming the log.
+	return state, discardCompacted(entries, meta.Index), nil
+}
+
+// replayLocked reconstructs state from the log file alone, without consulting
+// the snapshot. The caller holds the lock.
+func (w *WAL) replayLocked() (raft.HardState, []raft.LogEntry, error) {
 	info, err := w.file.Stat()
 	if err != nil {
 		return raft.HardState{}, nil, fmt.Errorf("wal: stat: %w", err)

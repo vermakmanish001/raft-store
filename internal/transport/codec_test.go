@@ -58,6 +58,22 @@ func TestCodecRoundTrip(t *testing.T) {
 			},
 		},
 		{
+			name: "install snapshot",
+			msg: raft.InstallSnapshot{
+				Header:            raft.Header{From: "n1", To: "n2", Term: 9},
+				LastIncludedIndex: 500,
+				LastIncludedTerm:  8,
+				Data:              []byte(`{"kv":{"a":"1"},"sessions":{}}`),
+			},
+		},
+		{
+			name: "install snapshot response",
+			msg: raft.InstallSnapshotResponse{
+				Header:     raft.Header{From: "n2", To: "n1", Term: 9},
+				MatchIndex: 500,
+			},
+		},
+		{
 			name: "append response with conflict hint",
 			msg: raft.AppendEntriesResponse{
 				Header:        raft.Header{From: "n2", To: "n1", Term: 7},

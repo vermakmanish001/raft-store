@@ -19,17 +19,17 @@ Built incrementally. Each milestone is independently runnable and tested.
 | 4 | Replicated KV store over a real cluster | **Complete** |
 | 5 | Durable persistence and crash recovery | **Complete** |
 | 6 | Request dedup and linearizable reads | **Complete** |
-| 7 | Snapshots and log compaction | Next |
-| 8 | Cluster membership and observability | Planned |
+| 7 | Snapshots and log compaction | **Complete** |
+| 8 | Cluster membership and observability | Next |
 
 A cluster replicates writes, elects leaders, survives the loss of any minority
 of its nodes, and survives losing all of them: state reaches a crash-safe log
-before any RPC is answered. Reads are linearizable, and a client that
-identifies its requests gets exactly-once writes.
+before any RPC is answered. Reads are linearizable, a client that identifies
+its requests gets exactly-once writes, and the log is compacted so it does not
+grow without bound.
 
-One limitation remains. The log grows without bound, since nothing yet
-compacts it, so a long-running cluster replays an ever-longer log at startup.
-Snapshots address that next.
+What remains is operational rather than foundational: changing cluster
+membership without a restart, and metrics.
 
 ## Quickstart
 
@@ -142,7 +142,7 @@ terminal and not fine for a client that retries.
 | `PUT` | `/kv/{key}` | `204`, no body | `413` if the value exceeds 1 MiB |
 | `DELETE` | `/kv/{key}` | `204`, no body | `404` if absent |
 | `GET` | `/health` | `200` with `{"status":"ok"}` | |
-| `GET` | `/status` | `200` with role, term, leader, commit index | |
+| `GET` | `/status` | `200` with role, term, leader, commit and snapshot index | |
 | `POST` | `/raft/message` | `202`, peer RPC, not for clients | |
 
 `PUT` is idempotent and returns `204` for both a create and an overwrite,
@@ -165,6 +165,7 @@ conflated with readiness to serve reads.
 | `-peers` | empty | other nodes, as `id=url[,id=url...]` |
 | `-advertise` | derived | base URL peers use to reach this node |
 | `-data-dir` | empty | write-ahead log directory; empty keeps state in memory |
+| `-snapshot-threshold` | `1024` | compact once this many uncompacted entries accumulate; 0 disables |
 
 ## Design
 
@@ -176,7 +177,7 @@ internal/transport/ Raft RPCs over HTTP, plus the wire codec
 internal/fsm/       turns committed log entries into store mutations
 internal/store/     storage engine, concurrency-safe, knows nothing of Raft
 internal/api/       client HTTP: routing, status codes, leader redirection
-internal/wal/       crash-safe write-ahead log
+internal/wal/       crash-safe write-ahead log and snapshot store
 internal/config/    cluster configuration parsing
 ```
 
@@ -289,6 +290,46 @@ The confirmation rides on a heartbeat rather than a new RPC, and depends on no
 assumption about clock drift, which is what separates this from the faster
 lease-based alternative.
 
+## Snapshots and compaction
+
+Left alone, the log records every write forever. A long-running cluster would
+replay an ever-longer file at startup and keep entries whose effects were
+superseded years earlier. Once a threshold of uncompacted entries accumulates,
+a node serializes its state machine, records it as a snapshot, and discards
+every entry the snapshot covers.
+
+Three things make this delicate.
+
+The snapshot is taken at `lastApplied`, not at the commit index. An entry that
+is committed but not yet applied is not reflected in the state machine, so a
+snapshot claiming to cover it would silently lose its effect.
+
+The snapshot must be durable before any entry is discarded. A crash in that
+order leaves both the snapshot and the full log, which is merely redundant
+because loading filters entries the snapshot already covers. A crash in the
+other order leaves neither, and the state those entries described exists
+nowhere. Both the snapshot file and the rewritten log are installed by rename,
+so a crash mid-write leaves the previous version rather than half of each.
+
+The snapshot includes the session table from the previous section, and
+omitting it would be a silent correctness bug rather than a missed
+optimization. A node restored without it has forgotten which client requests
+it already applied, so deduplication would hold right up until the first
+snapshot and then quietly stop.
+
+Compaction also breaks the ordinary repair path. A leader normally walks a
+lagging follower's index backward until their logs agree, but there is nothing
+to walk back to once that prefix has been folded into a snapshot. Such a
+follower is sent the snapshot instead, through `InstallSnapshot`, and adopts
+its boundary as its own. A follower that already holds the entry the snapshot
+ends at keeps everything after it rather than refetching.
+
+Indexing is the other cost. After a snapshot the slice holds a suffix, so the
+entry at logical index `i` lives at position `i-S-1` rather than `i-1`. That
+arithmetic is confined to [internal/raft/log.go](internal/raft/log.go), which
+is why this step changed one file instead of producing an off-by-one in every
+function that touches the log.
+
 The key-value store has no knowledge of Raft. Replication is layered on top of
 it rather than woven into it, and store errors are sentinels tested with
 `errors.Is`. The function `errorStatus` in the API package is the single place
@@ -325,8 +366,8 @@ It asserts the status code of all fifteen request cases, prints a pass or fail
 line for each, cleans up the keys it wrote, and exits non-zero if any case
 fails, so it can be wired into CI later.
 
-Coverage by package: store and config at 100%, fsm 96%, raft 95%, api 91%,
-replica 90%, transport 85%, wal 84%.
+Coverage by package: store and config at 100%, raft 92%, fsm 92%, api 91%,
+replica 88%, transport 86%, wal 79%.
 
 ## License
 

@@ -494,7 +494,10 @@ func TestNewLeaderAppendsNoOp(t *testing.T) {
 	}
 
 	// Confirm the first append actually carries it.
-	out := n.appendTo("n1")
+	out, ok := n.appendTo("n1").(AppendEntries)
+	if !ok {
+		t.Fatalf("appendTo returned %T, want AppendEntries", n.appendTo("n1"))
+	}
 	if len(out.Entries) != 1 || out.Entries[0].Type != EntryNoOp {
 		t.Errorf("first append carried %d entries, want the no-op", len(out.Entries))
 	}

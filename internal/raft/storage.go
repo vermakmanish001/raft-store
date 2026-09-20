@@ -43,10 +43,37 @@ type Storage interface {
 	// TruncateFrom removes the entry at index and everything after it.
 	TruncateFrom(Index) error
 
-	// Load returns the persisted state, or a zero state and no entries for a
-	// node that has never run before.
+	// SaveSnapshot durably records a snapshot and discards every log entry at
+	// or before meta.Index.
+	//
+	// The snapshot must reach durable storage before any entry is discarded.
+	// A crash in the other order leaves a node with neither the entries nor
+	// the snapshot that replaced them, which is unrecoverable: the state those
+	// entries described exists nowhere.
+	SaveSnapshot(SnapshotMeta, []byte) error
+
+	// LoadSnapshot returns the most recent snapshot, or a zero meta and nil
+	// data if none was ever taken.
+	LoadSnapshot() (SnapshotMeta, []byte, error)
+
+	// Load returns the persisted term, vote, and the log entries that follow
+	// the most recent snapshot.
 	Load() (HardState, []LogEntry, error)
 }
+
+// SnapshotMeta describes where a snapshot sits in the log.
+//
+// Index and Term identify the last entry the snapshot includes. They are what
+// let a compacted log still answer the consistency check: a follower asked
+// about an index covered by the snapshot can compare against these instead of
+// against an entry it no longer holds.
+type SnapshotMeta struct {
+	Index Index
+	Term  Term
+}
+
+// IsEmpty reports whether any snapshot has been taken.
+func (m SnapshotMeta) IsEmpty() bool { return m.Index == 0 }
 
 // MemoryStorage is a Storage that keeps everything in memory.
 //
@@ -56,9 +83,11 @@ type Storage interface {
 // HardState exists to prevent. That is acceptable only because the cluster
 // treats it as a brand new node, and unacceptable in production.
 type MemoryStorage struct {
-	mu      sync.Mutex
-	state   HardState
-	entries []LogEntry
+	mu       sync.Mutex
+	state    HardState
+	entries  []LogEntry
+	snapMeta SnapshotMeta
+	snapData []byte
 }
 
 // NewMemoryStorage returns an empty in-memory Storage.
@@ -91,11 +120,47 @@ func (s *MemoryStorage) TruncateFrom(index Index) error {
 	if index == 0 {
 		return fmt.Errorf("raft: TruncateFrom(0): the log is 1-indexed")
 	}
-	if index > Index(len(s.entries)) {
-		return nil
+
+	// Entries are addressed by their own Index rather than their position,
+	// because compaction makes the slice a suffix of the logical log.
+	for i, entry := range s.entries {
+		if entry.Index >= index {
+			s.entries = s.entries[:i]
+			return nil
+		}
 	}
-	s.entries = s.entries[:index-1]
 	return nil
+}
+
+func (s *MemoryStorage) SaveSnapshot(meta SnapshotMeta, data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if meta.Index < s.snapMeta.Index {
+		// An older snapshot would move the log backward and discard entries
+		// the newer one already covers.
+		return fmt.Errorf("raft: snapshot at index %d is older than the stored one at %d",
+			meta.Index, s.snapMeta.Index)
+	}
+
+	s.snapMeta = meta
+	s.snapData = append([]byte(nil), data...)
+
+	kept := s.entries[:0]
+	for _, entry := range s.entries {
+		if entry.Index > meta.Index {
+			kept = append(kept, entry)
+		}
+	}
+	s.entries = append([]LogEntry(nil), kept...)
+	return nil
+}
+
+func (s *MemoryStorage) LoadSnapshot() (SnapshotMeta, []byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.snapMeta, append([]byte(nil), s.snapData...), nil
 }
 
 func (s *MemoryStorage) Load() (HardState, []LogEntry, error) {

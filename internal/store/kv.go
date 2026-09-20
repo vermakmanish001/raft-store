@@ -128,6 +128,37 @@ func (s *MemStore) Delete(key string) error {
 	return nil
 }
 
+// Snapshot returns a copy of every key and value.
+//
+// The copy matters. A snapshot is serialized while the store keeps serving, so
+// handing back the live map would race with concurrent writers and could
+// capture a half-written state that no replica ever actually held.
+func (s *MemStore) Snapshot() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make(map[string]string, len(s.data))
+	for k, v := range s.data {
+		out[k] = v
+	}
+	return out
+}
+
+// Restore replaces the entire contents with the given pairs.
+//
+// It replaces rather than merges. A snapshot describes the complete state at a
+// log position, so merging would leave behind keys that were deleted before
+// that position and make this replica disagree with every other one.
+func (s *MemStore) Restore(data map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.data = make(map[string]string, len(data))
+	for k, v := range data {
+		s.data[k] = v
+	}
+}
+
 // Len returns the number of keys currently held.
 //
 // It is not part of the Store interface because replicated implementations

@@ -34,9 +34,6 @@ func Sender(m Message) NodeID { return m.header().From }
 // Recipient returns the node a message is addressed to.
 func Recipient(m Message) NodeID { return m.header().To }
 
-// MessageTerm returns the term a message was sent in.
-func MessageTerm(m Message) Term { return m.header().Term }
-
 // RequestVote is sent by a candidate to gather votes (Section 5.2).
 type RequestVote struct {
 	Header
@@ -138,10 +135,48 @@ type AppendEntriesResponse struct {
 	ReadSeq uint64
 }
 
+// InstallSnapshot transfers a snapshot to a follower whose log has fallen
+// behind what the leader still holds (Section 7).
+//
+// It exists because compaction makes the ordinary repair path impossible. A
+// leader normally walks a lagging follower backward until their logs agree,
+// but once entries have been folded into a snapshot the leader no longer has
+// them to send, so there is nothing to walk back to. The snapshot replaces
+// that prefix wholesale.
+type InstallSnapshot struct {
+	Header
+
+	// LastIncludedIndex and LastIncludedTerm identify the final entry the
+	// snapshot covers. The follower adopts them as its own log boundary, which
+	// is what lets it answer a later consistency check about a position whose
+	// entry it no longer holds.
+	LastIncludedIndex Index
+	LastIncludedTerm  Term
+
+	// Data is the serialized state machine.
+	//
+	// It is sent whole rather than in chunks. The paper describes a chunked
+	// transfer with an offset and a done flag, which matters once a snapshot
+	// outgrows what fits comfortably in one message; at that point this field
+	// becomes a chunk and the receiver assembles them.
+	Data []byte
+}
+
+// InstallSnapshotResponse acknowledges a snapshot.
+type InstallSnapshotResponse struct {
+	Header
+
+	// MatchIndex is how far the follower is now known to have replicated,
+	// which after a successful install is the snapshot's last included index.
+	MatchIndex Index
+}
+
 // Compile-time assertions that every message type satisfies Message.
 var (
 	_ Message = RequestVote{}
 	_ Message = RequestVoteResponse{}
 	_ Message = AppendEntries{}
 	_ Message = AppendEntriesResponse{}
+	_ Message = InstallSnapshot{}
+	_ Message = InstallSnapshotResponse{}
 )
