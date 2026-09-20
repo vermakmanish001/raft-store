@@ -103,7 +103,7 @@ func (n *Node) mergeEntries(entries []LogEntry) {
 		existing, ok := n.entryAt(entry.Index)
 		if !ok {
 			// Past the end of the local log: everything from here is new.
-			n.log = append(n.log, entries[i:]...)
+			n.appendPersisted(entries[i:])
 			return
 		}
 
@@ -119,7 +119,7 @@ func (n *Node) mergeEntries(entries []LogEntry) {
 		// leader's and cannot have been committed, so it and everything after
 		// it are discarded (Section 5.3).
 		n.truncateFrom(entry.Index)
-		n.log = append(n.log, entries[i:]...)
+		n.appendPersisted(entries[i:])
 		return
 	}
 }

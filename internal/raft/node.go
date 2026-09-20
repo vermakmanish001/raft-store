@@ -45,6 +45,11 @@ type Config struct {
 	// source to make a run reproducible; production leaves it nil and gets a
 	// randomly seeded one.
 	Rand *rand.Rand
+
+	// Storage durably records term, vote, and log. A nil Storage gets an
+	// in-memory one, which is correct while the process runs and loses
+	// everything when it does not.
+	Storage Storage
 }
 
 // ErrInvalidConfig reports a configuration that cannot produce a correct node.
@@ -138,6 +143,16 @@ type Node struct {
 	// election it ever contested.
 	electionTimeout int
 
+	storage Storage
+
+	// fatal records a failure that makes further participation unsafe, almost
+	// always an inability to persist. A node that cannot write its term and
+	// vote to disk must stop rather than continue, because continuing means
+	// answering RPCs it may forget having answered. Once set, Tick and Step do
+	// nothing, so the node simply looks failed to its peers, which is a
+	// situation the cluster already knows how to survive.
+	fatal error
+
 	cfg  Config
 	rand *rand.Rand
 }
@@ -157,16 +172,73 @@ func NewNode(cfg Config) (*Node, error) {
 		rng = rand.New(rand.NewSource(rand.Int63()))
 	}
 
+	storage := cfg.Storage
+	if storage == nil {
+		storage = NewMemoryStorage()
+	}
+
+	// Recover whatever a previous incarnation of this node persisted. A fresh
+	// node gets a zero state and an empty log, so there is no separate
+	// first-boot path to get wrong.
+	hard, entries, err := storage.Load()
+	if err != nil {
+		return nil, fmt.Errorf("raft: loading persisted state: %w", err)
+	}
+
 	n := &Node{
 		id:    cfg.ID,
 		peers: append([]NodeID(nil), cfg.Peers...), // copy, so the caller cannot mutate membership behind our back
 		role:  Follower,
 		votes: make(map[NodeID]bool),
-		cfg:   cfg,
-		rand:  rng,
+
+		// Restored, not reset. A node that came back believing it had never
+		// voted would be free to vote a second time in a term it had already
+		// voted in, which is how one term ends up with two leaders.
+		currentTerm: hard.Term,
+		votedFor:    hard.VotedFor,
+		log:         entries,
+
+		storage: storage,
+		cfg:     cfg,
+		rand:    rng,
 	}
+
+	// A restarting node always begins as a follower, whatever it was before.
+	// Its peers may have elected someone else while it was gone, and assuming
+	// leadership without hearing from them would mean competing with a leader
+	// that legitimately holds a later term.
 	n.resetElectionTimer()
 	return n, nil
+}
+
+// Err returns the failure that stopped this node, or nil.
+//
+// The driver is expected to check it after Tick and Step and shut the node
+// down when it is set. There is no recovery: a node that could not persist has
+// no way to know what it already promised.
+func (n *Node) Err() error { return n.fatal }
+
+// setFatal records the first failure and keeps it.
+func (n *Node) setFatal(err error) {
+	if n.fatal == nil {
+		n.fatal = err
+	}
+}
+
+// persistHardState writes term and vote through to storage.
+//
+// It is called before the node acts on either, never after. Answering a
+// RequestVote and then persisting the vote would leave a window in which a
+// crash loses the record of a vote the peer has already counted.
+func (n *Node) persistHardState() {
+	if n.fatal != nil {
+		return
+	}
+	err := n.storage.SaveHardState(HardState{Term: n.currentTerm, VotedFor: n.votedFor})
+	if err != nil {
+		n.setFatal(fmt.Errorf("raft: persisting term %d and vote %q: %w",
+			n.currentTerm, n.votedFor, err))
+	}
 }
 
 // ID returns this node's identifier.
@@ -193,6 +265,10 @@ func (n *Node) VotedFor() NodeID { return n.votedFor }
 // a leader that reaches its heartbeat interval broadcasts. Returning messages
 // rather than sending them is what keeps this package free of I/O.
 func (n *Node) Tick() []Message {
+	if n.fatal != nil {
+		return nil
+	}
+
 	switch n.role {
 	case Leader:
 		n.heartbeatElapsed++
@@ -219,6 +295,10 @@ func (n *Node) Tick() []Message {
 // Messages addressed to another node are ignored rather than treated as an
 // error, so a broadcasting transport does not have to filter.
 func (n *Node) Step(msg Message) []Message {
+	if n.fatal != nil {
+		return nil
+	}
+
 	h := msg.header()
 	if h.To != "" && h.To != n.id {
 		return nil
@@ -279,6 +359,7 @@ func (n *Node) becomeFollower(term Term, leader NodeID) {
 	if term > n.currentTerm {
 		n.currentTerm = term
 		n.votedFor = ""
+		n.persistHardState()
 	}
 	n.role = Follower
 	n.leaderID = leader
@@ -294,6 +375,12 @@ func (n *Node) becomeCandidate() {
 	n.leaderID = ""
 	n.votedFor = n.id
 	n.votes = map[NodeID]bool{n.id: true}
+
+	// The new term and the self-vote reach disk before a single RequestVote
+	// goes out. A peer that granted a vote in this term must be able to rely
+	// on this node remembering it campaigned in it.
+	n.persistHardState()
+
 	n.resetElectionTimer()
 }
 
@@ -366,6 +453,9 @@ var ErrNotLeader = errors.New("raft: not leader")
 // caller must wait for the entry to be committed rather than treating a
 // successful Propose as success.
 func (n *Node) Propose(command []byte) (Index, []Message, error) {
+	if n.fatal != nil {
+		return 0, nil, n.fatal
+	}
 	if n.role != Leader {
 		return 0, nil, ErrNotLeader
 	}

@@ -8,7 +8,7 @@ PKG    := ./...
 ADDR   ?= :8081
 
 .PHONY: all build run test race cover vet fmt tidy clean check smoke \
-        cluster cluster-status cluster-kill-leader cluster-stop
+        cluster cluster-status cluster-kill-leader cluster-restart cluster-stop
 
 all: check build
 
@@ -39,6 +39,10 @@ cluster-status:
 ## cluster-kill-leader: stop the current leader and watch the cluster recover
 cluster-kill-leader:
 	@scripts/cluster.sh kill-leader
+
+## cluster-restart: kill every node and restart from the write-ahead logs
+cluster-restart:
+	@scripts/cluster.sh restart-all
 
 ## cluster-stop: shut the local cluster down
 cluster-stop:

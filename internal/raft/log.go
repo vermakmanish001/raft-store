@@ -1,5 +1,7 @@
 package raft
 
+import "fmt"
+
 // This file owns every translation between a Raft log index and a position in
 // the backing slice. The log is 1-indexed while the slice is 0-indexed, and
 // log compaction will later make the slice a suffix of the logical log rather
@@ -67,8 +69,30 @@ func (n *Node) appendEntry(term Term, typ EntryType, command []byte) LogEntry {
 		Type:    typ,
 		Command: command,
 	}
-	n.log = append(n.log, entry)
+	n.appendPersisted([]LogEntry{entry})
 	return entry
+}
+
+// appendPersisted adds entries to the in-memory log and to durable storage.
+//
+// Both happen here so the two can never disagree. An entry held in memory but
+// not on disk would vanish on restart after this node had already told a
+// leader it held it, and a leader counting that acknowledgement toward a
+// majority would consider an entry committed that a restart could erase.
+func (n *Node) appendPersisted(entries []LogEntry) {
+	if len(entries) == 0 {
+		return
+	}
+
+	n.log = append(n.log, entries...)
+
+	if n.fatal != nil {
+		return
+	}
+	if err := n.storage.Append(entries); err != nil {
+		n.setFatal(fmt.Errorf("raft: persisting %d entries at index %d: %w",
+			len(entries), entries[0].Index, err))
+	}
 }
 
 // truncateFrom discards the entry at index and everything after it.
@@ -84,6 +108,13 @@ func (n *Node) truncateFrom(index Index) {
 		return
 	}
 	n.log = n.log[:index-1]
+
+	if n.fatal != nil {
+		return
+	}
+	if err := n.storage.TruncateFrom(index); err != nil {
+		n.setFatal(fmt.Errorf("raft: truncating log from index %d: %w", index, err))
+	}
 }
 
 // logMatches reports whether the log contains an entry at index with the given

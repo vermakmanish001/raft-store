@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -30,6 +31,7 @@ import (
 	"github.com/vermakmanish001/raft-store/internal/replica"
 	"github.com/vermakmanish001/raft-store/internal/store"
 	"github.com/vermakmanish001/raft-store/internal/transport"
+	"github.com/vermakmanish001/raft-store/internal/wal"
 )
 
 const shutdownTimeout = 10 * time.Second
@@ -47,6 +49,7 @@ func run() error {
 		addr      = flag.String("addr", ":8080", "host:port for the client API and peer RPC")
 		peerSpec  = flag.String("peers", "", "other nodes, as id=url[,id=url...]")
 		advertise = flag.String("advertise", "", "base URL peers and clients use to reach this node")
+		dataDir   = flag.String("data-dir", "", "directory for the write-ahead log; empty means state is kept in memory and lost on restart")
 		logLevel  = flag.String("log-level", "info", "log verbosity: debug, info, warn, error")
 		logJSON   = flag.Bool("log-json", false, "emit logs as JSON instead of text")
 	)
@@ -91,12 +94,19 @@ func run() error {
 	tr.Start()
 	defer tr.Close()
 
+	storage, closeStorage, err := openStorage(*dataDir, *id, logger)
+	if err != nil {
+		return err
+	}
+	defer closeStorage()
+
 	rep, err := replica.New(replica.Config{
 		ID:          raft.NodeID(*id),
 		Peers:       config.PeerIDs(peers),
 		ClientAddrs: clientAddrs,
 		Transport:   tr,
 		Store:       store.New(),
+		Storage:     storage,
 		Logger:      logger,
 	})
 	if err != nil {
@@ -125,6 +135,7 @@ func run() error {
 		slog.String("addr", listener.Addr().String()),
 		slog.Int("peers", len(peers)),
 		slog.String("mode", clusterMode(len(peers))),
+		slog.String("storage", storageMode(*dataDir)),
 	)
 
 	serveErr := make(chan error, 1)
@@ -173,6 +184,42 @@ func advertisedURL(advertise, addr string, listener net.Listener) string {
 		host = "127.0.0.1"
 	}
 	return "http://" + net.JoinHostPort(host, port)
+}
+
+// openStorage returns the durable storage for this node, or an in-memory one
+// when no data directory is configured.
+//
+// The file is named after the node so that several nodes can share a directory
+// during local testing without one silently appending to another's log, which
+// would mix two nodes' terms and votes into nonsense.
+func openStorage(dataDir, id string, logger *slog.Logger) (raft.Storage, func(), error) {
+	if dataDir == "" {
+		logger.Warn("no -data-dir configured: term, vote, and log are kept in memory " +
+			"and lost on restart, which is unsafe outside development")
+		return raft.NewMemoryStorage(), func() {}, nil
+	}
+
+	path := filepath.Join(dataDir, id+".wal")
+	w, err := wal.Open(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening write-ahead log: %w", err)
+	}
+
+	if w.RecoveredPartialRecord() {
+		// Expected after a crash, and worth saying out loud: it confirms the
+		// previous run ended abruptly rather than shutting down cleanly.
+		logger.Info("discarded an incomplete record from the previous run",
+			slog.String("path", path))
+	}
+
+	return w, func() { w.Close() }, nil
+}
+
+func storageMode(dataDir string) string {
+	if dataDir == "" {
+		return "in-memory"
+	}
+	return "write-ahead log"
 }
 
 func clusterMode(peerCount int) string {

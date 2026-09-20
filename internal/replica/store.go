@@ -1,6 +1,7 @@
 package replica
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/vermakmanish001/raft-store/internal/fsm"
@@ -79,12 +80,15 @@ func (r *Replica) apply(cmd fsm.Command) error {
 	select {
 	case err := <-result:
 		return err
+	case <-r.doneC:
+		if storageErr := r.Err(); storageErr != nil {
+			return fmt.Errorf("%w: %v", ErrStorageFailed, storageErr)
+		}
+		return ErrShuttingDown
 	case <-timer.C:
 		// The entry was appended and may yet commit. The outcome is genuinely
 		// unknown to the client, which is why this is reported as a timeout
 		// rather than a failure.
 		return ErrTimeout
-	case <-r.doneC:
-		return ErrShuttingDown
 	}
 }

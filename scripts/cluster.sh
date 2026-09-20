@@ -7,7 +7,10 @@
 #   scripts/cluster.sh put <key> <value>  write, via any reachable node
 #   scripts/cluster.sh get <key>          read, via any reachable node
 #   scripts/cluster.sh kill-leader        stop whichever node currently leads
+#   scripts/cluster.sh restart-all        kill every node, then bring them back
 #   scripts/cluster.sh stop               shut the cluster down
+#
+# Nodes write a write-ahead log to .cluster/, so state survives a restart.
 #
 # put and get deliberately do not target a fixed port. Which node leads, and
 # which one kill-leader stops, changes from run to run, so a hardcoded address
@@ -37,6 +40,19 @@ peers_for() {
   echo "${out[*]}"
 }
 
+# launch starts the nodes without rebuilding or clearing state.
+launch() {
+  for i in "${!IDS[@]}"; do
+    ./bin/raftkv \
+      -id "${IDS[$i]}" \
+      -addr ":${PORTS[$i]}" \
+      -peers "$(peers_for "$i")" \
+      -data-dir "$DIR" \
+      >> "$DIR/${IDS[$i]}.log" 2>&1 &
+    echo $! > "$DIR/${IDS[$i]}.pid"
+  done
+}
+
 start() {
   mkdir -p "$DIR"
   go build -o bin/raftkv ./cmd/raftkv
@@ -48,14 +64,7 @@ start() {
     fi
   done
 
-  for i in "${!IDS[@]}"; do
-    ./bin/raftkv \
-      -id "${IDS[$i]}" \
-      -addr ":${PORTS[$i]}" \
-      -peers "$(peers_for "$i")" \
-      > "$DIR/${IDS[$i]}.log" 2>&1 &
-    echo $! > "$DIR/${IDS[$i]}.pid"
-  done
+  launch
 
   # An election needs at least one election timeout to complete.
   sleep 2
@@ -138,6 +147,26 @@ kill_leader() {
 # directory is cleaned, and a stop that depends on them alone leaves orphaned
 # nodes holding the ports with no supported way to release them. Falling back
 # to whoever holds the port makes stop mean what it says.
+# restart_all kills every node and brings them back from their write-ahead
+# logs. Without persistence this would lose everything, since a cluster with no
+# surviving member has nobody left to replicate from.
+restart_all() {
+  echo "killing all three nodes..."
+  for i in "${!IDS[@]}"; do
+    local pid
+    for pid in $(lsof -nP -iTCP:"${PORTS[$i]}" -sTCP:LISTEN -t 2>/dev/null); do
+      kill -9 "$pid" 2>/dev/null || true
+    done
+    rm -f "$DIR/${IDS[$i]}.pid"
+  done
+  sleep 1
+
+  echo "restarting from the write-ahead logs..."
+  launch
+  sleep 3
+  status
+}
+
 stop() {
   local stopped=0
 
@@ -177,6 +206,7 @@ case "${1:-}" in
   put)         [[ $# -eq 3 ]] || { echo "usage: $0 put <key> <value>" >&2; exit 2; }; put "$2" "$3" ;;
   get)         [[ $# -eq 2 ]] || { echo "usage: $0 get <key>" >&2; exit 2; }; get "$2" ;;
   kill-leader) kill_leader ;;
+  restart-all) restart_all ;;
   stop)        stop ;;
-  *) echo "usage: $0 {start|status|put <k> <v>|get <k>|kill-leader|stop}" >&2; exit 2 ;;
+  *) echo "usage: $0 {start|status|put <k> <v>|get <k>|kill-leader|restart-all|stop}" >&2; exit 2 ;;
 esac

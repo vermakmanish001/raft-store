@@ -35,6 +35,12 @@ func (n *Node) handleRequestVote(m RequestVote) []Message {
 	if granted {
 		n.votedFor = m.From
 
+		// The vote reaches disk before the response goes out. Reversing the
+		// order would leave a window where a crash loses a vote the candidate
+		// has already counted toward its majority, letting this node vote
+		// again in the same term for someone else.
+		n.persistHardState()
+
 		// Resetting the election timer only when a vote is actually granted
 		// matters. A node that reset on every RequestVote could be kept from
 		// ever campaigning by a peer with a stale log repeatedly asking for

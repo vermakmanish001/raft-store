@@ -410,3 +410,156 @@ func TestNewValidatesConfig(t *testing.T) {
 		}
 	})
 }
+
+// startReplica builds and starts a single-node replica against the given
+// storage, so a test can stop it and start another over the same state.
+func startReplica(t *testing.T, id raft.NodeID, storage raft.Storage) *replica.Replica {
+	t.Helper()
+
+	net := newMemNet()
+	r, err := replica.New(replica.Config{
+		ID:                 id,
+		Transport:          net.transport(id),
+		Store:              store.New(), // deliberately fresh: rebuilt by replaying the log
+		Storage:            storage,
+		TickInterval:       5 * time.Millisecond,
+		ElectionTimeoutMin: 4,
+		ElectionTimeoutMax: 8,
+		HeartbeatInterval:  1,
+		WriteTimeout:       3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("replica.New: %v", err)
+	}
+	r.Start()
+	return r
+}
+
+// TestStateSurvivesRestart is the point of durable storage. The replacement
+// replica is given an empty store, so every value it returns was rebuilt by
+// replaying the persisted log.
+func TestStateSurvivesRestart(t *testing.T) {
+	t.Parallel()
+
+	storage := raft.NewMemoryStorage()
+
+	first := startReplica(t, "n0", storage)
+	if !eventually(3*time.Second, func() bool { return first.Status().Role == "leader" }) {
+		t.Fatal("no leader elected")
+	}
+
+	want := map[string]string{"a": "1", "b": "2", "c": "3"}
+	for k, v := range want {
+		if err := first.Put(k, v); err != nil {
+			t.Fatalf("Put(%s): %v", k, err)
+		}
+	}
+	if err := first.Delete("b"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	delete(want, "b")
+
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// A new process, an empty store, the same log.
+	second := startReplica(t, "n0", storage)
+	t.Cleanup(func() { second.Close() })
+
+	if !eventually(3*time.Second, func() bool { return second.Status().Role == "leader" }) {
+		t.Fatalf("restarted replica never became leader: %+v", second.Status())
+	}
+
+	for k, v := range want {
+		var got string
+		if !eventually(3*time.Second, func() bool {
+			value, err := second.Get(k)
+			got = value
+			return err == nil && value == v
+		}) {
+			t.Errorf("after restart Get(%s) = %q, want %q", k, got, v)
+		}
+	}
+
+	// The deletion must have survived too. Replaying a log that forgot it
+	// would resurrect the key.
+	if _, err := second.Get("b"); !errors.Is(err, store.ErrKeyNotFound) {
+		t.Errorf("Get(b) after restart = %v, want %v; the delete was replayed away",
+			err, store.ErrKeyNotFound)
+	}
+}
+
+// TestTermSurvivesRestart: a node that forgot its term would restart at term
+// 0 and be free to vote again in a term it had already voted in.
+func TestTermSurvivesRestart(t *testing.T) {
+	t.Parallel()
+
+	storage := raft.NewMemoryStorage()
+
+	first := startReplica(t, "n0", storage)
+	if !eventually(3*time.Second, func() bool { return first.Status().Role == "leader" }) {
+		t.Fatal("no leader elected")
+	}
+	before := first.Status().Term
+	first.Close()
+
+	second := startReplica(t, "n0", storage)
+	t.Cleanup(func() { second.Close() })
+
+	if !eventually(3*time.Second, func() bool { return second.Status().Term >= before }) {
+		t.Errorf("term after restart = %d, want at least %d", second.Status().Term, before)
+	}
+}
+
+// brokenStorage fails writes after the first n of them, standing in for a disk
+// that fills up while the node is running.
+type brokenStorage struct {
+	raft.Storage
+	mu        sync.Mutex
+	allowed   int
+	failWith  error
+	attempted int
+}
+
+func (s *brokenStorage) SaveHardState(hs raft.HardState) error {
+	s.mu.Lock()
+	s.attempted++
+	over := s.attempted > s.allowed
+	s.mu.Unlock()
+
+	if over {
+		return s.failWith
+	}
+	return s.Storage.SaveHardState(hs)
+}
+
+// TestReplicaStopsWhenStorageFails: a node that cannot persist must stop and
+// say so, rather than accept writes it can never make durable.
+func TestReplicaStopsWhenStorageFails(t *testing.T) {
+	t.Parallel()
+
+	diskFull := errors.New("no space left on device")
+	storage := &brokenStorage{
+		Storage:  raft.NewMemoryStorage(),
+		allowed:  0, // fail from the very first persist
+		failWith: diskFull,
+	}
+
+	r := startReplica(t, "n0", storage)
+	t.Cleanup(func() { r.Close() })
+
+	// The first campaign must persist a term and self-vote, which fails.
+	if !eventually(3*time.Second, func() bool { return r.Status().Role == "stopped" }) {
+		t.Fatalf("replica kept running with failed storage: %+v", r.Status())
+	}
+
+	if err := r.Err(); !errors.Is(err, diskFull) {
+		t.Errorf("Err = %v, want it to wrap %v", err, diskFull)
+	}
+
+	err := r.Put("a", "1")
+	if !errors.Is(err, replica.ErrStorageFailed) && !errors.Is(err, replica.ErrShuttingDown) {
+		t.Errorf("Put after storage failure = %v, want a storage or shutdown error", err)
+	}
+}

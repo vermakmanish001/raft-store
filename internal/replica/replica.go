@@ -28,6 +28,12 @@ var (
 	// ErrShuttingDown reports that the replica stopped before the write
 	// resolved.
 	ErrShuttingDown = errors.New("replica: shutting down")
+
+	// ErrStorageFailed reports that the node could not persist and has
+	// stopped participating. There is no recovery in-process: a node that
+	// could not write its term and vote has no way to know what it already
+	// promised its peers.
+	ErrStorageFailed = errors.New("replica: storage failed, node stopped")
 )
 
 // Transport delivers Raft messages to peers and surfaces those received.
@@ -68,6 +74,11 @@ type Config struct {
 
 	// WriteTimeout bounds how long a client waits for its entry to commit.
 	WriteTimeout time.Duration
+
+	// Storage durably records term, vote, and log. A nil Storage gets an
+	// in-memory one, so the node participates correctly while it runs and
+	// remembers nothing across a restart.
+	Storage raft.Storage
 }
 
 // Defaults chosen so that an election completes in well under a second while
@@ -155,6 +166,11 @@ type Replica struct {
 
 	// pending is owned exclusively by the run loop. Nothing else may touch it.
 	pending map[raft.Index]pending
+
+	// storageErr is set by the run loop just before it exits, and read only
+	// after doneC is closed, which is what makes the handoff safe without a
+	// lock.
+	storageErr error
 }
 
 // Compile-time assertion that a Replica can stand in for a plain store.
@@ -177,6 +193,7 @@ func New(cfg Config) (*Replica, error) {
 		ElectionTimeoutMin: cfg.ElectionTimeoutMin,
 		ElectionTimeoutMax: cfg.ElectionTimeoutMax,
 		HeartbeatInterval:  cfg.HeartbeatInterval,
+		Storage:            cfg.Storage,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("replica: %w", err)
@@ -240,6 +257,19 @@ func (r *Replica) run() {
 
 		case <-r.stopC:
 			r.failPending(ErrShuttingDown)
+			return
+		}
+
+		// A node that could not persist has stopped participating. Keeping the
+		// loop running would leave clients waiting on writes that can never
+		// commit, so the replica shuts itself down and reports why.
+		if err := r.node.Err(); err != nil {
+			r.logger.Error("storage failure, node is stopping",
+				slog.String("id", string(r.cfg.ID)),
+				slog.Any("error", err),
+			)
+			r.storageErr = err
+			r.failPending(fmt.Errorf("%w: %v", ErrStorageFailed, err))
 			return
 		}
 	}
@@ -355,6 +385,19 @@ func (r *Replica) Status() Status {
 		return <-reply
 	case <-r.doneC:
 		return Status{ID: r.cfg.ID, Role: "stopped"}
+	}
+}
+
+// Err returns the storage failure that stopped this replica, or nil.
+//
+// It is meaningful only once the replica has stopped, which a caller learns
+// by seeing ErrStorageFailed from a write or "stopped" from Status.
+func (r *Replica) Err() error {
+	select {
+	case <-r.doneC:
+		return r.storageErr
+	default:
+		return nil
 	}
 }
 
