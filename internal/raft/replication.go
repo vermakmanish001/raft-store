@@ -37,6 +37,7 @@ func (n *Node) appendTo(peer NodeID) AppendEntries {
 		PrevLogTerm:  n.termAt(prevIndex),
 		Entries:      n.entriesFrom(next),
 		LeaderCommit: n.commitIndex,
+		ReadSeq:      n.readSeq,
 	}
 }
 
@@ -68,6 +69,11 @@ func (n *Node) handleAppendEntries(m AppendEntries) []Message {
 			Success:       false,
 			ConflictIndex: conflictIndex,
 			ConflictTerm:  conflictTerm,
+
+			// Echoed even on rejection. The counter proves this node still
+			// recognizes the sender as leader, which is all a read barrier
+			// asks; whether its log happens to match is a separate question.
+			ReadSeq: m.ReadSeq,
 		}}
 	}
 
@@ -93,6 +99,7 @@ func (n *Node) handleAppendEntries(m AppendEntries) []Message {
 		// follower may hold further entries from a deposed leader, and those
 		// are not evidence that this leader's entries replicated.
 		MatchIndex: m.PrevLogIndex + Index(len(m.Entries)),
+		ReadSeq:    m.ReadSeq,
 	}}
 }
 
@@ -154,6 +161,10 @@ func (n *Node) handleAppendEntriesResponse(m AppendEntriesResponse) []Message {
 	if n.role != Leader {
 		return nil
 	}
+
+	// Recorded before the success check. A follower that rejected an append
+	// still answered, and answering is what a read barrier needs to know.
+	n.recordReadAck(m.From, m.ReadSeq)
 
 	if !m.Success {
 		n.backoffNextIndex(m)

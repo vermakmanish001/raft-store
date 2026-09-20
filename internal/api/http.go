@@ -14,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 
 	"github.com/vermakmanish001/raft-store/internal/raft"
 	"github.com/vermakmanish001/raft-store/internal/replica"
@@ -26,6 +27,27 @@ import (
 type Cluster interface {
 	Status() replica.Status
 }
+
+// SessionStore is a store that can deduplicate client retries.
+//
+// It is an optional capability rather than part of store.Store, because a
+// plain in-memory store has no way to honor it and should not be made to
+// pretend otherwise.
+type SessionStore interface {
+	PutRequest(key, value string, req replica.Request) error
+	DeleteRequest(key string, req replica.Request) error
+}
+
+// Headers a client uses to identify a request for deduplication.
+const (
+	// HeaderClientID is a stable identifier for the client, reused across
+	// requests and across reconnections.
+	HeaderClientID = "X-Client-ID"
+
+	// HeaderSeq is a number the client increments once per distinct
+	// operation, and holds constant across retries of that operation.
+	HeaderSeq = "X-Request-Seq"
+)
 
 // DefaultMaxBodyBytes caps the size of a value accepted by PUT. Without a cap,
 // a single request could exhaust node memory; once entries flow through the
@@ -124,7 +146,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.store.Put(key, string(body)); err != nil {
+	if err := s.put(key, string(body), r); err != nil {
 		s.writeError(w, r, err)
 		return
 	}
@@ -137,12 +159,55 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 
 // handleDelete serves DELETE /kv/{key}.
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.Delete(r.PathValue("key")); err != nil {
+	if err := s.delete(r.PathValue("key"), r); err != nil {
 		s.writeError(w, r, err)
 		return
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// put writes through the deduplicating path when the store supports it and
+// the client identified its request.
+func (s *Server) put(key, value string, r *http.Request) error {
+	sessions, ok := s.store.(SessionStore)
+	req, identified := requestFrom(r)
+	if !ok || !identified {
+		return s.store.Put(key, value)
+	}
+	return sessions.PutRequest(key, value, req)
+}
+
+func (s *Server) delete(key string, r *http.Request) error {
+	sessions, ok := s.store.(SessionStore)
+	req, identified := requestFrom(r)
+	if !ok || !identified {
+		return s.store.Delete(key)
+	}
+	return sessions.DeleteRequest(key, req)
+}
+
+// requestFrom reads the deduplication headers, reporting whether the client
+// supplied a usable pair.
+//
+// Both headers are required together. A client ID without a sequence number
+// cannot distinguish one operation from the next, and a sequence number
+// without an ID does not say whose it is, so a partial pair is treated as
+// absent rather than guessed at.
+func requestFrom(r *http.Request) (replica.Request, bool) {
+	id := r.Header.Get(HeaderClientID)
+	raw := r.Header.Get(HeaderSeq)
+	if id == "" || raw == "" {
+		return replica.Request{}, false
+	}
+
+	seq, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || seq == 0 {
+		// Sequence numbers start at 1, so zero is indistinguishable from
+		// absent and is rejected rather than silently disabling dedup.
+		return replica.Request{}, false
+	}
+	return replica.Request{ClientID: id, Seq: seq}, true
 }
 
 // handleHealth reports process liveness. It deliberately says nothing about
@@ -202,6 +267,13 @@ func errorStatus(err error) (int, string) {
 		// redirected to instead. The cluster is mid-election and the client
 		// should retry shortly.
 		return http.StatusServiceUnavailable, "no leader elected, retry shortly"
+
+	case errors.Is(err, replica.ErrReadTimeout):
+		// The read changed nothing, so retrying is always safe. Saying so
+		// matters: a client told "outcome unknown" may hold back a retry it
+		// could have made immediately.
+		return http.StatusServiceUnavailable,
+			"could not reach a quorum to confirm this node still leads, retry shortly"
 
 	case errors.Is(err, replica.ErrTimeout):
 		// Deliberately not reported as a failure. The entry may still commit,

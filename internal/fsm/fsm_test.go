@@ -168,3 +168,287 @@ func entryFor(t *testing.T, cmd fsm.Command) raft.LogEntry {
 	}
 	return raft.LogEntry{Index: 1, Term: 1, Type: raft.EntryNormal, Command: data}
 }
+
+// applyCmd applies one command at the given log index.
+func applyCmd(t *testing.T, f *fsm.FSM, index uint64, cmd fsm.Command) error {
+	t.Helper()
+
+	data, err := cmd.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	return f.Apply(raft.LogEntry{
+		Index: raft.Index(index), Term: 1, Type: raft.EntryNormal, Command: data,
+	})
+}
+
+// TestRetryDoesNotOverwriteANewerWrite is the reason deduplication exists.
+//
+// A client whose write commits but whose response is lost cannot tell success
+// from failure, so it retries. If another client wrote the same key in the
+// interim, applying the retry silently destroys that newer value. The write
+// was never lost from the log, and every replica agrees on the result: the
+// data is simply wrong.
+func TestRetryDoesNotOverwriteANewerWrite(t *testing.T) {
+	t.Parallel()
+
+	st := store.New()
+	f := fsm.New(st)
+
+	// Client A writes, and its response is lost on the way back.
+	if err := applyCmd(t, f, 1, fsm.Command{
+		Op: fsm.OpPut, Key: "x", Value: "from A", ClientID: "client-a", Seq: 1,
+	}); err != nil {
+		t.Fatalf("A's write: %v", err)
+	}
+
+	// Client B writes the same key and is told it succeeded.
+	if err := applyCmd(t, f, 2, fsm.Command{
+		Op: fsm.OpPut, Key: "x", Value: "from B", ClientID: "client-b", Seq: 1,
+	}); err != nil {
+		t.Fatalf("B's write: %v", err)
+	}
+
+	// Client A retries the request it never heard back about.
+	if err := applyCmd(t, f, 3, fsm.Command{
+		Op: fsm.OpPut, Key: "x", Value: "from A", ClientID: "client-a", Seq: 1,
+	}); err != nil {
+		t.Fatalf("A's retry: %v", err)
+	}
+
+	got, err := st.Get("x")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got != "from B" {
+		t.Errorf("x = %q, want %q: A's retry destroyed a newer write that B was told had succeeded", got, "from B")
+	}
+}
+
+func TestDuplicateReturnsTheOriginalResult(t *testing.T) {
+	t.Parallel()
+
+	f := fsm.New(store.New())
+
+	// A delete of an absent key fails deterministically.
+	first := applyCmd(t, f, 1, fsm.Command{Op: fsm.OpDelete, Key: "ghost", ClientID: "c", Seq: 1})
+	if !errors.Is(first, store.ErrKeyNotFound) {
+		t.Fatalf("first delete = %v, want %v", first, store.ErrKeyNotFound)
+	}
+
+	// The retry must report the same outcome, not re-run and possibly differ.
+	again := applyCmd(t, f, 2, fsm.Command{Op: fsm.OpDelete, Key: "ghost", ClientID: "c", Seq: 1})
+	if !errors.Is(again, store.ErrKeyNotFound) {
+		t.Errorf("retry = %v, want the original %v", again, store.ErrKeyNotFound)
+	}
+}
+
+func TestOlderSequenceIsAlsoTreatedAsDuplicate(t *testing.T) {
+	t.Parallel()
+
+	st := store.New()
+	f := fsm.New(st)
+
+	for seq := uint64(1); seq <= 3; seq++ {
+		if err := applyCmd(t, f, seq, fsm.Command{
+			Op: fsm.OpPut, Key: "x", Value: "v" + string(rune('0'+seq)), ClientID: "c", Seq: seq,
+		}); err != nil {
+			t.Fatalf("seq %d: %v", seq, err)
+		}
+	}
+
+	// A long-delayed duplicate of an earlier request arrives.
+	if err := applyCmd(t, f, 4, fsm.Command{
+		Op: fsm.OpPut, Key: "x", Value: "stale", ClientID: "c", Seq: 1,
+	}); err != nil {
+		t.Fatalf("stale retry: %v", err)
+	}
+
+	if got, _ := st.Get("x"); got != "v3" {
+		t.Errorf("x = %q, want %q; a request older than the last applied is already answered", got, "v3")
+	}
+}
+
+func TestNewSequenceIsApplied(t *testing.T) {
+	t.Parallel()
+
+	st := store.New()
+	f := fsm.New(st)
+
+	for seq := uint64(1); seq <= 5; seq++ {
+		if err := applyCmd(t, f, seq, fsm.Command{
+			Op: fsm.OpPut, Key: "x", Value: "v" + string(rune('0'+seq)), ClientID: "c", Seq: seq,
+		}); err != nil {
+			t.Fatalf("seq %d: %v", seq, err)
+		}
+	}
+
+	if got, _ := st.Get("x"); got != "v5" {
+		t.Errorf("x = %q, want %q; distinct requests must each apply", got, "v5")
+	}
+}
+
+// TestUnidentifiedRequestsAreNotDeduplicated documents the at-least-once
+// fallback for a client that supplies no ID, such as a plain curl.
+func TestUnidentifiedRequestsAreNotDeduplicated(t *testing.T) {
+	t.Parallel()
+
+	st := store.New()
+	f := fsm.New(st)
+
+	applyCmd(t, f, 1, fsm.Command{Op: fsm.OpPut, Key: "x", Value: "first"})
+	applyCmd(t, f, 2, fsm.Command{Op: fsm.OpPut, Key: "x", Value: "second"})
+	applyCmd(t, f, 3, fsm.Command{Op: fsm.OpPut, Key: "x", Value: "first"})
+
+	if got, _ := st.Get("x"); got != "first" {
+		t.Errorf("x = %q, want %q: without a client ID every command applies", got, "first")
+	}
+	if n := f.Sessions(); n != 0 {
+		t.Errorf("Sessions = %d, want 0; unidentified requests must not consume table space", n)
+	}
+}
+
+// TestSessionsRebuildOnReplay: the table is derived entirely from the log, so
+// a restarting node reconstructs it and a failover leaves it intact.
+func TestSessionsRebuildOnReplay(t *testing.T) {
+	t.Parallel()
+
+	entries := []fsm.Command{
+		{Op: fsm.OpPut, Key: "x", Value: "from A", ClientID: "client-a", Seq: 1},
+		{Op: fsm.OpPut, Key: "x", Value: "from B", ClientID: "client-b", Seq: 1},
+	}
+
+	// A different node, or the same one after a restart, replays the log into
+	// a fresh store and a fresh table.
+	st := store.New()
+	f := fsm.New(st)
+	for i, cmd := range entries {
+		if err := applyCmd(t, f, uint64(i+1), cmd); err != nil {
+			t.Fatalf("replaying %d: %v", i, err)
+		}
+	}
+
+	// A's retry reaches the rebuilt node and must still be recognized.
+	applyCmd(t, f, 3, fsm.Command{Op: fsm.OpPut, Key: "x", Value: "from A", ClientID: "client-a", Seq: 1})
+
+	if got, _ := st.Get("x"); got != "from B" {
+		t.Errorf("x = %q, want %q; the rebuilt session table failed to catch the retry", got, "from B")
+	}
+}
+
+// TestSessionEvictionIsDeterministic is a correctness requirement, not a
+// tidiness one. Every replica applies the same log and must reach the same
+// state. If eviction depended on wall-clock time, or on Go's randomized map
+// iteration order, two replicas would remember different clients, disagree
+// about which retries are duplicates, and diverge.
+//
+// The check is the one that actually matters: feed an identical log to
+// independent state machines and require identical results.
+func TestSessionEvictionIsDeterministic(t *testing.T) {
+	t.Parallel()
+
+	const (
+		clients = 30
+		cap     = 8
+	)
+
+	// The log: every client writes, then every client retries. Which retries
+	// are suppressed depends entirely on which sessions survived eviction.
+	var log []fsm.Command
+	for i := range clients {
+		log = append(log, fsm.Command{
+			Op: fsm.OpPut, Key: key(i), Value: "original", ClientID: clientName(i), Seq: 1,
+		})
+	}
+	// Retries run newest client first. Retrying oldest first would evict each
+	// surviving session before reaching it, so every retry would apply and the
+	// test would compare two uniformly wrong results.
+	for i := clients - 1; i >= 0; i-- {
+		log = append(log, fsm.Command{
+			Op: fsm.OpPut, Key: key(i), Value: "RETRY-APPLIED", ClientID: clientName(i), Seq: 1,
+		})
+	}
+
+	replay := func() []string {
+		st := store.New()
+		f := fsm.New(st, fsm.WithMaxSessions(cap))
+
+		for i, cmd := range log {
+			applyCmd(t, f, uint64(i+1), cmd)
+		}
+
+		values := make([]string, clients)
+		for i := range clients {
+			v, err := st.Get(key(i))
+			if err != nil {
+				t.Fatalf("Get(%s): %v", key(i), err)
+			}
+			values[i] = v
+		}
+		return values
+	}
+
+	first := replay()
+
+	// The test is only meaningful if eviction actually happened, meaning some
+	// retries were suppressed and others were not.
+	var suppressed, applied int
+	for _, v := range first {
+		if v == "original" {
+			suppressed++
+		} else {
+			applied++
+		}
+	}
+	if suppressed == 0 || applied == 0 {
+		t.Fatalf("every retry behaved the same way (%d suppressed, %d applied); "+
+			"the cap did not take effect and the test proves nothing", suppressed, applied)
+	}
+
+	for run := range 25 {
+		got := replay()
+		for i := range got {
+			if got[i] != first[i] {
+				t.Fatalf("run %d diverged at %s: got %q, first run got %q; "+
+					"two replicas applying this log would disagree",
+					run, key(i), got[i], first[i])
+			}
+		}
+	}
+}
+
+func clientName(i int) string {
+	return "client-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
+}
+
+func key(i int) string {
+	return "key-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
+}
+
+// TestEvictionKeepsRecentClients: the client most likely to retry is the one
+// that just wrote, so it must not be the one evicted.
+func TestEvictionKeepsRecentClients(t *testing.T) {
+	t.Parallel()
+
+	st := store.New()
+	f := fsm.New(st, fsm.WithMaxSessions(3))
+
+	index := uint64(0)
+	next := func(cmd fsm.Command) {
+		index++
+		applyCmd(t, f, index, cmd)
+	}
+
+	next(fsm.Command{Op: fsm.OpPut, Key: "x", Value: "old", ClientID: "oldest", Seq: 1})
+	next(fsm.Command{Op: fsm.OpPut, Key: "x", Value: "b", ClientID: "b", Seq: 1})
+	next(fsm.Command{Op: fsm.OpPut, Key: "x", Value: "c", ClientID: "c", Seq: 1})
+
+	// A fourth client evicts the least recently used, which is "oldest".
+	next(fsm.Command{Op: fsm.OpPut, Key: "x", Value: "d", ClientID: "d", Seq: 1})
+
+	// "d" just wrote, so its retry must still be recognized.
+	next(fsm.Command{Op: fsm.OpPut, Key: "x", Value: "d", ClientID: "d", Seq: 1})
+	if got, _ := st.Get("x"); got != "d" {
+		t.Errorf("x = %q, want %q; a recent client's retry was not deduplicated", got, "d")
+	}
+}

@@ -93,6 +93,18 @@ type AppendEntries struct {
 	// that entries it already holds are now committed without a second round
 	// trip.
 	LeaderCommit Index
+
+	// ReadSeq is a counter the leader increments for each read barrier. A
+	// follower echoes it back untouched.
+	//
+	// It is what lets a leader prove it still leads before serving a read. A
+	// leader partitioned away from its cluster continues to believe it leads
+	// until its next election timeout, and would otherwise answer reads from
+	// state that the real leader has already moved past. Hearing this counter
+	// echoed by a majority establishes that no other leader existed at the
+	// moment the read was registered, which is what makes the read
+	// linearizable without assuming anything about clock drift.
+	ReadSeq uint64
 }
 
 // AppendEntriesResponse answers an AppendEntries.
@@ -121,6 +133,9 @@ type AppendEntriesResponse struct {
 	// follower that returned nonsense would only make recovery slower.
 	ConflictIndex Index
 	ConflictTerm  Term
+
+	// ReadSeq echoes the value from the request that prompted this response.
+	ReadSeq uint64
 }
 
 // Compile-time assertions that every message type satisfies Message.

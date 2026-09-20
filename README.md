@@ -18,24 +18,18 @@ Built incrementally. Each milestone is independently runnable and tested.
 | 3 | Log replication | **Complete** |
 | 4 | Replicated KV store over a real cluster | **Complete** |
 | 5 | Durable persistence and crash recovery | **Complete** |
-| 6 | Request dedup and linearizable reads | Next |
-| 7 | Snapshots and log compaction | Planned |
+| 6 | Request dedup and linearizable reads | **Complete** |
+| 7 | Snapshots and log compaction | Next |
 | 8 | Cluster membership and observability | Planned |
 
 A cluster replicates writes, elects leaders, survives the loss of any minority
-of its nodes, and now survives losing all of them: state is written to a
-crash-safe log before any RPC is answered, so every node can be killed and
-restarted with no data loss. Two limitations remain, each addressed by a later
-step and each stated plainly rather than hidden:
+of its nodes, and survives losing all of them: state reaches a crash-safe log
+before any RPC is answered. Reads are linearizable, and a client that
+identifies its requests gets exactly-once writes.
 
-- **Writes are at-least-once.** A write interrupted by a leader change is
-  reported as failed, and a client retry applies it twice. Fixing this needs
-  request deduplication held in replicated state.
-- **Reads are not linearizable.** They are served from the leader's applied
-  state, which can lag or come from a leader that has already been deposed
-  without noticing.
-
-The log also grows without bound, which log compaction addresses later.
+One limitation remains. The log grows without bound, since nothing yet
+compacts it, so a long-running cluster replays an ever-longer log at startup.
+Snapshots address that next.
 
 ## Quickstart
 
@@ -82,6 +76,20 @@ Every node is killed with SIGKILL and restarted from its write-ahead log. With
 no surviving member there is nobody to replicate from, so anything that comes
 back was read off disk.
 
+To see deduplication, run the same write twice with the same headers, with
+another client's write in between:
+
+```bash
+BASE=http://127.0.0.1:8181
+curl -sL -X PUT -d 'from A' -H 'X-Client-ID: a' -H 'X-Request-Seq: 1' $BASE/kv/x
+curl -sL -X PUT -d 'from B' -H 'X-Client-ID: b' -H 'X-Request-Seq: 1' $BASE/kv/x
+curl -sL -X PUT -d 'from A' -H 'X-Client-ID: a' -H 'X-Request-Seq: 1' $BASE/kv/x
+curl -sL $BASE/kv/x
+```
+
+The value is `from B`. Drop the headers and repeat, and it is `from A`: the
+retry has destroyed a write that another client was told had succeeded.
+
 Those helpers pick whichever node is reachable rather than a fixed port, which
 matters more than it sounds: the leader is whichever node wins the election,
 so the node `kill-leader` stops differs from run to run. A hardcoded address
@@ -116,6 +124,17 @@ exits rather than starting in a broken state.
 The request body of a `PUT` is the raw value, which keeps the API usable from
 curl without JSON quoting. All responses are JSON. Keys are a single path
 segment, so a key containing a slash does not match a route.
+
+Writes may carry two headers that make them exactly-once:
+
+| Header | Meaning |
+|--------|---------|
+| `X-Client-ID` | stable identifier for the client, reused across requests |
+| `X-Request-Seq` | increments once per operation, held constant across retries |
+
+Both are required together; a partial pair is treated as absent. Without them
+a write is at-least-once, which is fine for a one-shot command typed at a
+terminal and not fine for a client that retries.
 
 | Method | Path | Success | Failure |
 |--------|------|---------|---------|
@@ -237,6 +256,39 @@ looks like a failed node to its peers, which is a situation the cluster
 already knows how to survive, as opposed to a node answering RPCs it may not
 remember having answered.
 
+## Exactly-once writes and linearizable reads
+
+A client whose write commits but whose response is lost, because the leader
+crashed in between, cannot tell success from failure and has to retry. Applying
+that retry a second time is harmless for a repeated write of the same value,
+and quietly destructive otherwise: if another client wrote the same key in the
+interim, the late duplicate overwrites a newer value that its author was told
+had succeeded. Nothing is lost from the log and every replica agrees on the
+result. The data is simply wrong.
+
+Requests that carry a client ID and sequence number are therefore recorded in a
+session table as they apply, and a repeat returns the original outcome without
+touching the store. That table is built from the log alone, so every replica
+constructs the same one, a restarting node rebuilds it by replaying, and it
+survives failover. It is capped, and eviction is driven by a counter of applied
+commands rather than by a clock, because two replicas evicting different
+clients would start disagreeing about which retries are duplicates. An evicted
+client's retry can still apply twice, which is the honest cost of a bounded
+table; production systems resolve it with sessions that clients renew.
+
+Reads do not go through the log, which would cost a round trip and an entry to
+change nothing. Instead a leader clears a barrier before answering. It waits
+to hear from a majority that it still leads, because a leader partitioned away
+from its cluster keeps believing it leads until its election timeout elapses
+and would otherwise answer from state the real leader has moved past. It also
+waits until its own state machine has applied everything committed when the
+read arrived, since even a legitimate leader can hold entries it has not yet
+applied. Only then does it read.
+
+The confirmation rides on a heartbeat rather than a new RPC, and depends on no
+assumption about clock drift, which is what separates this from the faster
+lease-based alternative.
+
 The key-value store has no knowledge of Raft. Replication is layered on top of
 it rather than woven into it, and store errors are sentinels tested with
 `errors.Is`. The function `errorStatus` in the API package is the single place
@@ -273,7 +325,7 @@ It asserts the status code of all fifteen request cases, prints a pass or fail
 line for each, cleans up the keys it wrote, and exits non-zero if any case
 fails, so it can be wired into CI later.
 
-Coverage by package: store and config at 100%, raft 95%, fsm 94%, api 91%,
+Coverage by package: store and config at 100%, fsm 96%, raft 95%, api 91%,
 replica 90%, transport 85%, wal 84%.
 
 ## License

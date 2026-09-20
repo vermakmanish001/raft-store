@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/vermakmanish001/raft-store/internal/api"
@@ -393,3 +394,172 @@ type erroringStore struct{ err error }
 func (s erroringStore) Get(string) (string, error) { return "", s.err }
 func (s erroringStore) Put(string, string) error   { return s.err }
 func (s erroringStore) Delete(string) error        { return s.err }
+
+// sessionRecorder records what reached the deduplicating write path.
+type sessionRecorder struct {
+	store.Store
+	mu       sync.Mutex
+	requests []replica.Request
+	plain    int
+}
+
+func (s *sessionRecorder) PutRequest(key, value string, req replica.Request) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requests = append(s.requests, req)
+	return nil
+}
+
+func (s *sessionRecorder) DeleteRequest(key string, req replica.Request) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requests = append(s.requests, req)
+	return nil
+}
+
+func (s *sessionRecorder) Put(string, string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.plain++
+	return nil
+}
+
+func (s *sessionRecorder) Delete(string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.plain++
+	return nil
+}
+
+func TestDeduplicationHeaders(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		clientID  string
+		seq       string
+		wantDedup bool
+		wantReq   replica.Request
+	}{
+		{
+			name: "both headers present", clientID: "client-a", seq: "7",
+			wantDedup: true, wantReq: replica.Request{ClientID: "client-a", Seq: 7},
+		},
+		{
+			name:      "no headers at all",
+			wantDedup: false,
+		},
+		{
+			name: "client ID without a sequence number", clientID: "client-a",
+			wantDedup: false,
+		},
+		{
+			name: "sequence number without a client ID", seq: "7",
+			wantDedup: false,
+		},
+		{
+			name: "sequence number is not a number", clientID: "client-a", seq: "soon",
+			wantDedup: false,
+		},
+		{
+			name: "sequence number zero", clientID: "client-a", seq: "0",
+			wantDedup: false,
+		},
+		{
+			name: "negative sequence number", clientID: "client-a", seq: "-1",
+			wantDedup: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			recorder := &sessionRecorder{Store: store.New()}
+			h := api.NewServer(recorder, nil).Handler()
+
+			req := httptest.NewRequest(http.MethodPut, "/kv/alpha", strings.NewReader("value"))
+			if tc.clientID != "" {
+				req.Header.Set(api.HeaderClientID, tc.clientID)
+			}
+			if tc.seq != "" {
+				req.Header.Set(api.HeaderSeq, tc.seq)
+			}
+
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusNoContent {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+			}
+
+			recorder.mu.Lock()
+			defer recorder.mu.Unlock()
+
+			if tc.wantDedup {
+				if len(recorder.requests) != 1 {
+					t.Fatalf("deduplicating path called %d times, want 1", len(recorder.requests))
+				}
+				if recorder.requests[0] != tc.wantReq {
+					t.Errorf("request = %+v, want %+v", recorder.requests[0], tc.wantReq)
+				}
+			} else {
+				if recorder.plain != 1 {
+					t.Errorf("plain path called %d times, want 1", recorder.plain)
+				}
+				if len(recorder.requests) != 0 {
+					t.Errorf("deduplicating path was used with an unusable header pair: %+v",
+						recorder.requests)
+				}
+			}
+		})
+	}
+}
+
+// TestDeduplicationHeadersOnDelete: the same handling applies to deletions.
+func TestDeduplicationHeadersOnDelete(t *testing.T) {
+	t.Parallel()
+
+	recorder := &sessionRecorder{Store: store.New()}
+	h := api.NewServer(recorder, nil).Handler()
+
+	req := httptest.NewRequest(http.MethodDelete, "/kv/alpha", nil)
+	req.Header.Set(api.HeaderClientID, "client-a")
+	req.Header.Set(api.HeaderSeq, "3")
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.requests) != 1 || recorder.requests[0].Seq != 3 {
+		t.Errorf("requests = %+v, want one with seq 3", recorder.requests)
+	}
+}
+
+// TestPlainStoreIgnoresHeaders: a store with no deduplication support must
+// still serve the request rather than failing.
+func TestPlainStoreIgnoresHeaders(t *testing.T) {
+	t.Parallel()
+
+	st := store.New()
+	h := api.NewServer(st, nil).Handler()
+
+	req := httptest.NewRequest(http.MethodPut, "/kv/alpha", strings.NewReader("value"))
+	req.Header.Set(api.HeaderClientID, "client-a")
+	req.Header.Set(api.HeaderSeq, "1")
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+	if got, err := st.Get("alpha"); err != nil || got != "value" {
+		t.Errorf("store: %q, %v; want the write to have landed", got, err)
+	}
+}

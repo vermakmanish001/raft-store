@@ -135,6 +135,13 @@ type Node struct {
 	nextIndex  map[NodeID]Index
 	matchIndex map[NodeID]Index
 
+	// readSeq counts leadership-confirmation rounds, and ackedRead records
+	// how far each follower has echoed. Both are leader-only and rebuilt on
+	// election, because a previous leader's confirmations say nothing about
+	// this one's.
+	readSeq   uint64
+	ackedRead map[NodeID]uint64
+
 	electionElapsed  int
 	heartbeatElapsed int
 
@@ -401,9 +408,12 @@ func (n *Node) becomeLeader() {
 	// differ.
 	n.nextIndex = make(map[NodeID]Index, len(n.peers))
 	n.matchIndex = make(map[NodeID]Index, len(n.peers))
+	n.ackedRead = make(map[NodeID]uint64, len(n.peers))
+	n.readSeq = 0
 	for _, peer := range n.peers {
 		n.nextIndex[peer] = n.lastLogIndex() + 1
 		n.matchIndex[peer] = 0
+		n.ackedRead[peer] = 0
 	}
 
 	// Append a no-op for this term. See EntryNoOp: without an entry from its

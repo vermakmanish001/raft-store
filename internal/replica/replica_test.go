@@ -123,6 +123,7 @@ func newTestCluster(t *testing.T, size int) *testCluster {
 			ElectionTimeoutMax: 16,
 			HeartbeatInterval:  1,
 			WriteTimeout:       3 * time.Second,
+			ReadTimeout:        1 * time.Second,
 		})
 		if err != nil {
 			t.Fatalf("replica.New(%s): %v", id, err)
@@ -427,6 +428,7 @@ func startReplica(t *testing.T, id raft.NodeID, storage raft.Storage) *replica.R
 		ElectionTimeoutMax: 8,
 		HeartbeatInterval:  1,
 		WriteTimeout:       3 * time.Second,
+		ReadTimeout:        1 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("replica.New: %v", err)
@@ -561,5 +563,143 @@ func TestReplicaStopsWhenStorageFails(t *testing.T) {
 	err := r.Put("a", "1")
 	if !errors.Is(err, replica.ErrStorageFailed) && !errors.Is(err, replica.ErrShuttingDown) {
 		t.Errorf("Put after storage failure = %v, want a storage or shutdown error", err)
+	}
+}
+
+// TestRetryIsDeduplicated exercises the whole path: an identified request
+// replicated through the log, retried, and recognized on apply.
+func TestRetryIsDeduplicated(t *testing.T) {
+	t.Parallel()
+
+	c := newTestCluster(t, 3)
+	leader := c.leader()
+
+	req := replica.Request{ClientID: "client-a", Seq: 1}
+	if err := leader.PutRequest("x", "from A", req); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+
+	// Another client overwrites the key and is told it succeeded.
+	if err := leader.PutRequest("x", "from B", replica.Request{ClientID: "client-b", Seq: 1}); err != nil {
+		t.Fatalf("B's write: %v", err)
+	}
+
+	// Client A never saw its response and retries the identical request.
+	if err := leader.PutRequest("x", "from A", req); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+
+	got, err := leader.Get("x")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got != "from B" {
+		t.Errorf("x = %q, want %q; the retry destroyed a write another client was told had succeeded",
+			got, "from B")
+	}
+}
+
+// TestUnidentifiedRetryAppliesTwice documents the fallback honestly. Without a
+// client ID there is nothing to deduplicate against.
+func TestUnidentifiedRetryAppliesTwice(t *testing.T) {
+	t.Parallel()
+
+	c := newTestCluster(t, 3)
+	leader := c.leader()
+
+	if err := leader.Put("x", "first"); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := leader.Put("x", "second"); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := leader.Put("x", "first"); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	got, _ := leader.Get("x")
+	if got != "first" {
+		t.Errorf("x = %q, want %q; unidentified writes each apply in order", got, "first")
+	}
+}
+
+// TestPartitionedLeaderRefusesReads is the linearizability guarantee. A leader
+// cut off from its cluster still believes it leads, and must refuse to answer
+// from state the real leader has moved past.
+func TestPartitionedLeaderRefusesReads(t *testing.T) {
+	t.Parallel()
+
+	c := newTestCluster(t, 3)
+	leader := c.leader()
+
+	if err := leader.Put("x", "before the partition"); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if _, err := leader.Get("x"); err != nil {
+		t.Fatalf("Get before the partition: %v", err)
+	}
+
+	c.net.isolate(leader.Status().ID)
+
+	// However stale its view, it cannot hear from a majority, so it cannot
+	// establish that it still leads.
+	_, err := leader.Get("x")
+	if err == nil {
+		t.Fatal("a partitioned leader served a read; the value may already be stale")
+	}
+	if !errors.Is(err, replica.ErrReadTimeout) && !errors.Is(err, raft.ErrNotLeader) {
+		t.Errorf("Get = %v, want a read-confirmation failure or not-leader error", err)
+	}
+}
+
+// TestReadSeesItsOwnWrite is the most basic linearizability expectation, and
+// the one a leader lagging its own commit index would break.
+func TestReadSeesItsOwnWrite(t *testing.T) {
+	t.Parallel()
+
+	c := newTestCluster(t, 3)
+	leader := c.leader()
+
+	for i := range 25 {
+		value := "v" + string(rune('a'+i))
+		if err := leader.Put("x", value); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+
+		got, err := leader.Get("x")
+		if err != nil {
+			t.Fatalf("Get %d: %v", i, err)
+		}
+		if got != value {
+			t.Fatalf("after writing %q, read %q; a write that returned must be visible", value, got)
+		}
+	}
+}
+
+// TestReadAfterFailoverSeesCommittedWrites: the new leader must not answer
+// from state older than what the previous leader had committed.
+func TestReadAfterFailoverSeesCommittedWrites(t *testing.T) {
+	t.Parallel()
+
+	c := newTestCluster(t, 3)
+	old := c.leader()
+
+	if err := old.Put("x", "committed before failover"); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	c.net.isolate(old.Status().ID)
+
+	fresh := c.leader()
+
+	var got string
+	if !eventually(3*time.Second, func() bool {
+		v, err := fresh.Get("x")
+		got = v
+		return err == nil
+	}) {
+		t.Fatalf("new leader never served a read: last value %q\n%s", got, c.dump())
+	}
+	if got != "committed before failover" {
+		t.Errorf("x = %q, want the value committed before the old leader failed", got)
 	}
 }

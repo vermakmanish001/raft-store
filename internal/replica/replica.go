@@ -29,6 +29,16 @@ var (
 	// resolved.
 	ErrShuttingDown = errors.New("replica: shutting down")
 
+	// ErrReadTimeout reports that a node could not confirm it still leads
+	// within the timeout, so it refused to answer rather than risk returning
+	// state a newer leader has already moved past.
+	//
+	// It is distinct from ErrTimeout because the situations differ in a way
+	// the client cares about. A write timeout is ambiguous: the entry may
+	// still commit. A read that could not be confirmed changed nothing at
+	// all, so retrying it is always safe.
+	ErrReadTimeout = errors.New("replica: could not confirm leadership for a linearizable read")
+
 	// ErrStorageFailed reports that the node could not persist and has
 	// stopped participating. There is no recovery in-process: a node that
 	// could not write its term and vote has no way to know what it already
@@ -75,6 +85,16 @@ type Config struct {
 	// WriteTimeout bounds how long a client waits for its entry to commit.
 	WriteTimeout time.Duration
 
+	// ReadTimeout bounds how long a linearizable read waits for a majority to
+	// confirm this node still leads.
+	//
+	// It is shorter than WriteTimeout by default because the two fail
+	// differently. A write that times out may still commit, so waiting longer
+	// can turn an ambiguous answer into a definite one. A read that cannot be
+	// confirmed will not become confirmable by waiting: either a majority is
+	// reachable within about an election timeout or it is not.
+	ReadTimeout time.Duration
+
 	// Storage durably records term, vote, and log. A nil Storage gets an
 	// in-memory one, so the node participates correctly while it runs and
 	// remembers nothing across a restart.
@@ -90,6 +110,7 @@ const (
 	defaultElectionTimeoutMax = 20
 	defaultHeartbeatInterval  = 2
 	defaultWriteTimeout       = 5 * time.Second
+	defaultReadTimeout        = 2 * time.Second
 )
 
 func (c *Config) applyDefaults() {
@@ -108,6 +129,9 @@ func (c *Config) applyDefaults() {
 	if c.WriteTimeout <= 0 {
 		c.WriteTimeout = defaultWriteTimeout
 	}
+	if c.ReadTimeout <= 0 {
+		c.ReadTimeout = defaultReadTimeout
+	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -124,12 +148,35 @@ type Status struct {
 	LastApplied uint64      `json:"last_applied"`
 }
 
+// Request identifies a client operation so a retry can be recognized as one.
+//
+// A zero Request disables deduplication for that operation, which is the
+// at-least-once behavior and is fine for a one-shot command typed at a
+// terminal. A client library supplies a stable ClientID and a Seq that
+// increments per distinct operation, retrying the same pair until it gets an
+// answer.
+type Request struct {
+	ClientID string
+	Seq      uint64
+}
+
 // proposal is a client write awaiting commitment.
 type proposal struct {
 	command []byte
 
 	// result is buffered so the consensus loop can resolve a proposal whose
 	// caller has already given up, without blocking.
+	result chan error
+}
+
+// readBarrier is a client read awaiting leadership confirmation.
+type readBarrier struct {
+	result chan error
+}
+
+// pendingRead links a registered barrier to the client waiting on it.
+type pendingRead struct {
+	req    raft.ReadRequest
 	result chan error
 }
 
@@ -160,12 +207,15 @@ type Replica struct {
 	logger *slog.Logger
 
 	proposeC chan proposal
+	readC    chan readBarrier
 	statusC  chan chan Status
 	stopC    chan struct{}
 	doneC    chan struct{}
 
-	// pending is owned exclusively by the run loop. Nothing else may touch it.
-	pending map[raft.Index]pending
+	// pending and pendingReads are owned exclusively by the run loop. Nothing
+	// else may touch them.
+	pending      map[raft.Index]pending
+	pendingReads []pendingRead
 
 	// storageErr is set by the run loop just before it exits, and read only
 	// after doneC is closed, which is what makes the handoff safe without a
@@ -207,6 +257,7 @@ func New(cfg Config) (*Replica, error) {
 		tr:       cfg.Transport,
 		logger:   cfg.Logger,
 		proposeC: make(chan proposal),
+		readC:    make(chan readBarrier),
 		statusC:  make(chan chan Status),
 		stopC:    make(chan struct{}),
 		doneC:    make(chan struct{}),
@@ -252,6 +303,9 @@ func (r *Replica) run() {
 		case p := <-r.proposeC:
 			r.propose(p)
 
+		case b := <-r.readC:
+			r.registerRead(b)
+
 		case reply := <-r.statusC:
 			reply <- r.status()
 
@@ -283,6 +337,7 @@ func (r *Replica) dispatch(msgs []raft.Message) {
 	}
 
 	r.applyCommitted()
+	r.resolveReads()
 
 	// A node that is no longer leader cannot know whether its uncommitted
 	// entries will survive. Failing the clients now is the honest answer: they
@@ -353,12 +408,61 @@ func (r *Replica) propose(p proposal) {
 	r.applyCommitted()
 }
 
-// failPending completes every waiting write with the same error.
+// registerRead opens a read barrier and records the client waiting on it.
+func (r *Replica) registerRead(b readBarrier) {
+	req, msgs, err := r.node.ReadIndex()
+	if err != nil {
+		b.result <- err
+		return
+	}
+
+	r.pendingReads = append(r.pendingReads, pendingRead{req: req, result: b.result})
+
+	for _, msg := range msgs {
+		r.tr.Send(msg)
+	}
+
+	// A single-node cluster confirms itself, so the barrier may already be
+	// satisfied and need not wait for a tick.
+	r.resolveReads()
+}
+
+// resolveReads releases reads whose barrier is satisfied and fails those that
+// can no longer be satisfied.
+func (r *Replica) resolveReads() {
+	if len(r.pendingReads) == 0 {
+		return
+	}
+
+	kept := r.pendingReads[:0]
+	for _, read := range r.pendingReads {
+		switch {
+		case r.node.ReadReady(read.req):
+			read.result <- nil
+
+		case r.node.ReadExpired(read.req):
+			// Leadership was lost. Confirmation under the old term proves
+			// nothing, so the client is told to find the new leader rather
+			// than waiting for a timeout it can do nothing about.
+			read.result <- raft.ErrNotLeader
+
+		default:
+			kept = append(kept, read)
+		}
+	}
+	r.pendingReads = kept
+}
+
+// failPending completes every waiting write and read with the same error.
 func (r *Replica) failPending(err error) {
 	for index, waiting := range r.pending {
 		waiting.result <- err
 		delete(r.pending, index)
 	}
+	for _, read := range r.pendingReads {
+		read.result <- err
+	}
+	r.pendingReads = nil
 }
 
 // status snapshots consensus state. Called only from the run loop.
