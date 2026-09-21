@@ -34,6 +34,36 @@ func logRequests(logger *slog.Logger) middleware {
 	}
 }
 
+// allowCrossOrigin permits browser requests from any origin.
+//
+// This is what lets the bundled dashboard work at all. It is served by one
+// node, but a write addressed to a follower is answered with a redirect to the
+// leader on a different port, and a browser treats that as cross-origin.
+//
+// It adds no exposure here, because the API has no authentication: anyone who
+// can reach the port can already do anything with curl, and the only new
+// capability is a page on another origin making requests that carry no ambient
+// credentials. A deployment that added authentication would have to replace
+// this with an explicit origin allowlist and credentialed CORS, since a
+// wildcard combined with cookies is how a browser is tricked into acting for
+// someone else.
+func allowCrossOrigin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Client-ID, X-Request-Seq")
+
+		// A preflight asks what is permitted and expects no body. Answering it
+		// here keeps every handler from having to know about CORS.
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 // statusRecorder captures the status code written by a handler, which the
 // ResponseWriter interface otherwise provides no way to read back.
 type statusRecorder struct {

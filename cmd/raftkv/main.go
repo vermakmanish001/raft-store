@@ -31,6 +31,7 @@ import (
 	"github.com/vermakmanish001/raft-store/internal/replica"
 	"github.com/vermakmanish001/raft-store/internal/store"
 	"github.com/vermakmanish001/raft-store/internal/transport"
+	"github.com/vermakmanish001/raft-store/internal/ui"
 	"github.com/vermakmanish001/raft-store/internal/wal"
 )
 
@@ -53,6 +54,7 @@ func run() error {
 		snapEvery = flag.Int("snapshot-threshold", 1024, "compact the log once this many uncompacted entries accumulate; 0 disables compaction")
 		logLevel  = flag.String("log-level", "info", "log verbosity: debug, info, warn, error")
 		logJSON   = flag.Bool("log-json", false, "emit logs as JSON instead of text")
+		withUI    = flag.Bool("ui", true, "serve the bundled cluster dashboard at /")
 	)
 	flag.Parse()
 
@@ -124,6 +126,13 @@ func run() error {
 	root.Handle("POST "+transport.Path, tr.Handler())
 	root.Handle("/", api.NewServer(rep, logger, api.WithCluster(rep)).Handler())
 
+	// The pattern matches the root path exactly, so everything else still
+	// falls through to the API. Registering the dashboard on a bare "/" would
+	// shadow the whole API instead.
+	if *withUI {
+		root.Handle("GET /{$}", ui.Handler())
+	}
+
 	srv := &http.Server{
 		Handler:           root,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -139,6 +148,7 @@ func run() error {
 		slog.Int("peers", len(peers)),
 		slog.String("mode", clusterMode(len(peers))),
 		slog.String("storage", storageMode(*dataDir)),
+		slog.Bool("dashboard", *withUI),
 	)
 
 	serveErr := make(chan error, 1)

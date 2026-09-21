@@ -26,6 +26,10 @@ import (
 // status endpoint.
 type Cluster interface {
 	Status() replica.Status
+
+	// Peers returns every member's client base URL, keyed by node ID and
+	// including this node.
+	Peers() map[raft.NodeID]string
 }
 
 // SessionStore is a store that can deduplicate client retries.
@@ -63,6 +67,11 @@ type Server struct {
 	cluster      Cluster
 	logger       *slog.Logger
 	maxBodyBytes int64
+
+	// peerClient fetches peer status for the cluster view. It is separate from
+	// the Raft transport's client because the two want different timeouts:
+	// consensus must not wait, while an operator view can afford to.
+	peerClient *http.Client
 }
 
 // Option customizes a Server.
@@ -89,6 +98,7 @@ func NewServer(st store.Store, logger *slog.Logger, opts ...Option) *Server {
 		store:        st,
 		logger:       logger,
 		maxBodyBytes: DefaultMaxBodyBytes,
+		peerClient:   &http.Client{Timeout: peerStatusTimeout},
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -110,8 +120,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /ready", s.handleReady)
+	mux.HandleFunc("GET /cluster", s.handleCluster)
 
-	return logRequests(s.logger)(mux)
+	return logRequests(s.logger)(allowCrossOrigin(mux))
 }
 
 // handleGet serves GET /kv/{key}.

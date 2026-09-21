@@ -43,6 +43,8 @@ Start a single node:
 make run
 ```
 
+Then open <http://127.0.0.1:8081> for the bundled dashboard.
+
 Or a three-node cluster on ports 8181 through 8183:
 
 ```bash
@@ -64,6 +66,16 @@ scripts/cluster.sh get durable
 ```
 
 The value comes back from a node that was never the one you wrote to.
+
+Open <http://127.0.0.1:8181> while doing this. The dashboard shows every
+member's role, term, and commit index, and logs transitions as they happen, so
+an election that resolves in under a second is visible rather than inferred:
+
+```
+14:22:07  n3 became unreachable
+14:22:08  n1 moved to term 2
+14:22:08  n2 became leader in term 2
+```
 
 To watch it survive the loss of the *entire* cluster, which is what durable
 storage buys:
@@ -146,6 +158,8 @@ terminal and not fine for a client that retries.
 | `GET` | `/health` | `200` once the process is up | |
 | `GET` | `/ready` | `200` once a leader is known | `503` during an election |
 | `GET` | `/status` | `200` with role, term, leader, commit and snapshot index | |
+| `GET` | `/cluster` | `200` with every member's state, as this node sees it | |
+| `GET` | `/` | `200` with the dashboard, unless `-ui=false` | |
 | `POST` | `/raft/message` | `202`, peer RPC, not for clients | |
 
 `PUT` is idempotent and returns `204` for both a create and an overwrite,
@@ -175,6 +189,7 @@ restarts healthy nodes mid-election or routes to nodes that cannot answer.
 | `-advertise` | derived | base URL peers use to reach this node |
 | `-data-dir` | empty | write-ahead log directory; empty keeps state in memory |
 | `-snapshot-threshold` | `1024` | compact once this many uncompacted entries accumulate; 0 disables |
+| `-ui` | `true` | serve the bundled dashboard at `/` |
 
 ## Design
 
@@ -188,6 +203,7 @@ internal/store/     storage engine, concurrency-safe, knows nothing of Raft
 internal/api/       client HTTP: routing, status codes, leader redirection
 internal/wal/       crash-safe write-ahead log and snapshot store
 internal/config/    cluster configuration parsing
+internal/ui/        embedded cluster dashboard
 ```
 
 The dependency arrows all point one way. The store knows nothing of Raft, the
@@ -338,6 +354,30 @@ entry at logical index `i` lives at position `i-S-1` rather than `i-1`. That
 arithmetic is confined to [internal/raft/log.go](internal/raft/log.go), which
 is why this step changed one file instead of producing an off-by-one in every
 function that touches the log.
+
+## Dashboard
+
+Every node serves a dashboard at `/`, embedded in the binary. There is no
+build step, no framework, and no external request, so it works on a machine
+with no network.
+
+It polls `/cluster`, which reports what the node it is talking to believes
+about every member. That is deliberately one node's point of view rather than
+ground truth. Members disagree during an election, and a partitioned node
+reports a leader that no longer leads. Merging their answers into a single
+authoritative picture would invent agreement that does not exist, and hide
+exactly the disagreement worth seeing.
+
+The page diffs consecutive polls and logs transitions, because an election
+that resolves in under a second is otherwise invisible: the display simply
+shows a different leader than it did a moment ago.
+
+Writes addressed to a follower are answered with a redirect to the leader on a
+different port, which a browser treats as cross-origin, so the API sends
+permissive CORS headers. That adds no exposure here because the API has no
+authentication to begin with: anyone who can reach the port can already do
+anything with curl. A deployment that added authentication would have to
+replace the wildcard with an explicit origin allowlist.
 
 The key-value store has no knowledge of Raft. Replication is layered on top of
 it rather than woven into it, and store errors are sentinels tested with

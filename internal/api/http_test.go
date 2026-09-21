@@ -237,9 +237,14 @@ func decode(t *testing.T, rec *httptest.ResponseRecorder, v any) {
 }
 
 // stubCluster reports a fixed consensus state.
-type stubCluster struct{ status replica.Status }
+type stubCluster struct {
+	status replica.Status
+	peers  map[raft.NodeID]string
+}
 
 func (s stubCluster) Status() replica.Status { return s.status }
+
+func (s stubCluster) Peers() map[raft.NodeID]string { return s.peers }
 
 // TestLeaderRedirect covers the path a client hits when it addresses a
 // follower. The write must be forwarded rather than refused.

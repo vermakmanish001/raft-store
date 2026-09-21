@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>raft-store</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --border: #e2e5ea;
+    --text: #15181d;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --leader: #047857;
+    --leader-bg: #d1fae5;
+    --follower: #4b5563;
+    --follower-bg: #eef0f3;
+    --candidate: #b45309;
+    --candidate-bg: #fef3c7;
+    --down: #b91c1c;
+    --down-bg: #fee2e2;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --panel: #171a21;
+      --border: #272b34;
+      --text: #e6e8ec;
+      --muted: #9aa3b2;
+      --accent: #60a5fa;
+      --leader: #34d399;
+      --leader-bg: #064e3b;
+      --follower: #cbd5e1;
+      --follower-bg: #242833;
+      --candidate: #fbbf24;
+      --candidate-bg: #4a3209;
+      --down: #f87171;
+      --down-bg: #4c1d1d;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 24px 16px 48px;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+
+  .wrap { max-width: 1040px; margin: 0 auto; }
+
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 20px;
+  }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  h1 span { color: var(--muted); font-weight: 400; }
+
+  .conn { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+  .conn.bad { color: var(--down); }
+
+  .nodes {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+
+  .node {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    transition: border-color .2s;
+  }
+  .node.is-leader { border-color: var(--leader); }
+  .node.is-down { opacity: .72; }
+
+  .node-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .node-id { font-family: var(--mono); font-size: 15px; font-weight: 600; }
+  .self { color: var(--muted); font-weight: 400; font-size: 11px; }
+
+  .badge {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    padding: 3px 8px;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .badge.leader    { color: var(--leader);    background: var(--leader-bg); }
+  .badge.follower  { color: var(--follower);  background: var(--follower-bg); }
+  .badge.candidate { color: var(--candidate); background: var(--candidate-bg); }
+  .badge.down      { color: var(--down);      background: var(--down-bg); }
+
+  dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; }
+  dt { color: var(--muted); font-size: 12px; }
+  dd { margin: 0; font-family: var(--mono); font-size: 12px; text-align: right; }
+
+  .cols {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 16px;
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .panel h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--muted);
+    margin: 0 0 12px;
+    font-weight: 600;
+  }
+
+  .row { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  input {
+    flex: 1 1 120px;
+    min-width: 0;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+  button {
+    padding: 8px 14px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button:active { transform: translateY(1px); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { opacity: .9; color: #fff; }
+
+  .result {
+    margin-top: 10px;
+    padding: 10px 12px;
+    border-radius: 7px;
+    background: var(--bg);
+    font-family: var(--mono);
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    min-height: 38px;
+  }
+  .result.err { color: var(--down); }
+
+  .events {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    max-height: 260px;
+    overflow-y: auto;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .events li {
+    padding: 5px 0;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 10px;
+  }
+  .events li:last-child { border-bottom: 0; }
+  .events time { color: var(--muted); flex: none; }
+  .events .up   { color: var(--leader); }
+  .events .down { color: var(--down); }
+  .empty { color: var(--muted); font-style: italic; }
+
+  footer { margin-top: 20px; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>raft-store <span id="observer"></span></h1>
+    <div class="conn" id="conn">connecting…</div>
+  </header>
+
+  <div class="nodes" id="nodes"></div>
+
+  <div class="cols">
+    <section class="panel">
+      <h2>Key-value</h2>
+      <div class="row">
+        <input id="key" placeholder="key" autocomplete="off" spellcheck="false">
+        <input id="value" placeholder="value" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="row">
+        <button class="primary" id="put">Put</button>
+        <button id="get">Get</button>
+        <button id="del">Delete</button>
+      </div>
+      <div class="result" id="result"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Cluster events</h2>
+      <ul class="events" id="events">
+        <li class="empty">watching…</li>
+      </ul>
+    </section>
+  </div>
+
+  <footer>
+    Writes go to the leader; addressing a follower returns a redirect. Kill the
+    leader process and watch the remaining nodes elect a new one.
+  </footer>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const $ = (id) => document.getElementById(id);
+  const POLL_MS = 500;
+  const MAX_EVENTS = 60;
+
+  // previous holds the last successful poll, so each new one can be diffed
+  // against it. The interesting things here are transitions, not values: a
+  // leader changing is worth announcing, a commit index ticking up is not.
+  let previous = null;
+  let everConnected = false;
+
+  const fmt = (n) => (n === undefined || n === null ? "—" : String(n));
+
+  function roleOf(node) {
+    if (!node.reachable) return "down";
+    const role = node.status && node.status.role;
+    return role === "leader" || role === "candidate" ? role : "follower";
+  }
+
+  function render(view) {
+    $("observer").textContent = view.observed_by ? "as seen by " + view.observed_by : "";
+
+    const nodes = view.nodes || [];
+    if (nodes.length === 0) {
+      $("nodes").innerHTML =
+        '<div class="panel"><span class="empty">running as a single node, no cluster configured</span></div>';
+      return;
+    }
+
+    $("nodes").innerHTML = nodes.map((node) => {
+      const role = roleOf(node);
+      const s = node.status || {};
+      const rows = node.reachable
+        ? [
+            ["term", fmt(s.term)],
+            ["commit", fmt(s.commit_index)],
+            ["applied", fmt(s.last_applied)],
+            ["log entries", fmt(s.log_entries)],
+            ["snapshot", s.snapshot_index ? fmt(s.snapshot_index) : "none"],
+          ]
+        : [["", node.error || "unreachable"]];
+
+      return `
+        <div class="node ${role === "leader" ? "is-leader" : ""} ${node.reachable ? "" : "is-down"}">
+          <div class="node-top">
+            <span class="node-id">${esc(node.id)}${node.self ? ' <span class="self">this node</span>' : ""}</span>
+            <span class="badge ${role}">${role === "down" ? "unreachable" : esc(role)}</span>
+          </div>
+          <dl>${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>
+        </div>`;
+    }).join("");
+  }
+
+  // diff announces transitions between two polls. Without it an election that
+  // resolves in under a second is invisible: the page simply shows a different
+  // leader than it did a moment ago, with no indication anything happened.
+  function diff(before, after) {
+    const byId = (view) => Object.fromEntries((view.nodes || []).map((n) => [n.id, n]));
+    const was = byId(before);
+    const now = byId(after);
+
+    for (const id of Object.keys(now)) {
+      const a = was[id];
+      const b = now[id];
+      if (!a) continue;
+
+      if (a.reachable && !b.reachable) event(`${id} became unreachable`, "down");
+      if (!a.reachable && b.reachable) event(`${id} came back`, "up");
+      if (!a.status || !b.status) continue;
+
+      if (a.status.role !== b.status.role && b.status.role === "leader") {
+        event(`${id} became leader in term ${b.status.term}`, "up");
+      }
+      if (b.status.term > a.status.term && b.status.role !== "leader") {
+        event(`${id} moved to term ${b.status.term}`);
+      }
+    }
+  }
+
+  function event(text, kind) {
+    const list = $("events");
+    list.querySelector(".empty")?.remove();
+
+    const li = document.createElement("li");
+    const t = document.createElement("time");
+    t.textContent = new Date().toLocaleTimeString();
+    const span = document.createElement("span");
+    if (kind) span.className = kind;
+    span.textContent = text;
+
+    li.append(t, span);
+    list.prepend(li);
+
+    while (list.children.length > MAX_EVENTS) list.lastElementChild.remove();
+  }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  async function poll() {
+    try {
+      const res = await fetch("/cluster", { cache: "no-store" });
+      if (!res.ok) throw new Error(res.status);
+      const view = await res.json();
+
+      $("conn").textContent = "live";
+      $("conn").classList.remove("bad");
+
+      if (previous) diff(previous, view);
+      else if (!everConnected) event("connected");
+      everConnected = true;
+
+      previous = view;
+      render(view);
+    } catch {
+      $("conn").textContent = "disconnected";
+      $("conn").classList.add("bad");
+      if (everConnected) {
+        event("lost contact with this node", "down");
+        everConnected = false;
+        previous = null;
+      }
+    }
+  }
+
+  function show(text, isError) {
+    const el = $("result");
+    el.textContent = text;
+    el.classList.toggle("err", Boolean(isError));
+  }
+
+  async function op(method) {
+    const key = $("key").value.trim();
+    if (!key) return show("enter a key", true);
+
+    const url = "/kv/" + encodeURIComponent(key);
+    const init = { method, cache: "no-store" };
+    if (method === "PUT") init.body = $("value").value;
+
+    try {
+      const res = await fetch(url, init);
+      const body = await res.text();
+
+      if (method === "GET" && res.ok) {
+        const parsed = JSON.parse(body);
+        $("value").value = parsed.value;
+        return show(`${res.status}  ${key} = ${JSON.stringify(parsed.value)}`);
+      }
+      show(`${res.status}  ${body || "(no body)"}`, !res.ok);
+    } catch (err) {
+      // A redirect to a leader the browser cannot reach fails here rather
+      // than returning a status, so the message names the likely cause.
+      show(`request failed: ${err.message}\ncheck that the leader is reachable from this browser`, true);
+    }
+  }
+
+  $("get").onclick = () => op("GET");
+  $("put").onclick = () => op("PUT");
+  $("del").onclick = () => op("DELETE");
+  $("key").addEventListener("keydown", (e) => { if (e.key === "Enter") op("GET"); });
+  $("value").addEventListener("keydown", (e) => { if (e.key === "Enter") op("PUT"); });
+
+  poll();
+  setInterval(poll, POLL_MS);
+})();
+</script>
+</body>
+</html>

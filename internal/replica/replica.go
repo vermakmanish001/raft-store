@@ -609,6 +609,19 @@ func (r *Replica) Status() Status {
 	}
 }
 
+// Peers returns every cluster member's client base URL, including this node's.
+//
+// Consensus never needs this; it is for redirection and for reporting cluster
+// state to an operator. The map is copied so a caller cannot reshape this
+// replica's view of its own cluster.
+func (r *Replica) Peers() map[raft.NodeID]string {
+	out := make(map[raft.NodeID]string, len(r.cfg.ClientAddrs))
+	for id, addr := range r.cfg.ClientAddrs {
+		out[id] = addr
+	}
+	return out
+}
+
 // Err returns the storage failure that stopped this replica, or nil.
 //
 // It is meaningful only once the replica has stopped, which a caller learns
