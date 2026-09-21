@@ -65,9 +65,7 @@ start() {
   done
 
   launch
-
-  # An election needs at least one election timeout to complete.
-  sleep 2
+  wait_for_leader
   status
   echo
   echo "logs: $DIR/*.log"
@@ -116,6 +114,24 @@ get() {
   curl -sSL -w '  [%{http_code}]\n' "$base/kv/$key"
 }
 
+# wait_for_leader polls until one node reports itself leader.
+#
+# Polling rather than sleeping a fixed interval matters on a loaded machine or
+# a CI runner, where an election can take several times longer than it does
+# locally. A fixed sleep there reports a healthy cluster as broken.
+wait_for_leader() {
+  local deadline=$((SECONDS + 30))
+  while (( SECONDS < deadline )); do
+    if leader_index >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.3
+  done
+
+  echo "no leader after 30s; check $DIR/*.log" >&2
+  return 1
+}
+
 leader_index() {
   for i in "${!IDS[@]}"; do
     if curl -sS --max-time 2 "$(url_for "$i")/status" 2>/dev/null | grep -q '"role":"leader"'; then
@@ -136,7 +152,7 @@ kill_leader() {
   rm -f "$DIR/${IDS[$i]}.pid"
 
   echo "waiting for the survivors to elect a new leader..."
-  sleep 3
+  wait_for_leader
   status
 }
 
@@ -163,7 +179,7 @@ restart_all() {
 
   echo "restarting from the write-ahead logs..."
   launch
-  sleep 3
+  wait_for_leader
   status
 }
 

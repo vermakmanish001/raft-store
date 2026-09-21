@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel an in-progress run when new commits land on the same branch, so a
+# rapid series of pushes does not queue up runs of code nobody is waiting on.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Read the version from go.mod rather than pinning it here, so the
+          # two cannot drift apart.
+          go-version-file: go.mod
+
+      # Each check is its own step so a failure names itself in the summary,
+      # rather than hiding inside one opaque "make check".
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test under the race detector
+        run: go test -race ./...
+
+      - name: Coverage
+        run: |
+          go test -coverprofile=coverage.out ./internal/... > /dev/null
+          go tool cover -func=coverage.out | tail -1
+
+  end-to-end:
+    name: End-to-end
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # The unit tests exercise the algorithm against an in-memory transport and
+    # clock. These steps run the real binary over real sockets, which is the
+    # only way to catch wiring mistakes that in-process tests cannot see.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build the node
+        run: go build -o bin/raftkv ./cmd/raftkv
+
+      - name: Single node
+        run: |
+          set -euo pipefail
+
+          ./bin/raftkv -id ci -addr :8081 -data-dir "$RUNNER_TEMP/single" > node.log 2>&1 &
+          node=$!
+
+          # Wait on /ready, not /health. The node answers /health as soon as
+          # it binds its port, which is before it has taken part in an
+          # election, so a client that starts then gets "no leader elected".
+          # Failing loudly with the node's own output beats a blind sleep
+          # turning a startup failure into a pile of connection errors.
+          ready=false
+          for _ in $(seq 60); do
+            if curl -sf http://127.0.0.1:8081/ready >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 0.5
+          done
+          if [ "$ready" != true ]; then
+            echo "the node never became ready:"
+            cat node.log
+            exit 1
+          fi
+
+          scripts/smoke.sh http://127.0.0.1:8081
+          kill "$node"
+
+      - name: Three-node cluster with failover
+        run: |
+          set -euo pipefail
+          scripts/cluster.sh start
+          scripts/cluster.sh put durable 'survives a crash'
+
+          scripts/cluster.sh kill-leader
+
+          # The value must come back from a node that never received the
+          # original write.
+          got=$(scripts/cluster.sh get durable)
+          echo "$got"
+          case "$got" in
+            *'survives a crash'*) ;;
+            *) echo "data did not survive the loss of the leader"; exit 1 ;;
+          esac
+
+      - name: Whole-cluster restart
+        run: |
+          set -euo pipefail
+          scripts/cluster.sh restart-all
+
+          # Every node was killed, so nothing could be replicated from a peer.
+          # Anything that comes back was read off disk.
+          got=$(scripts/cluster.sh get durable)
+          echo "$got"
+          case "$got" in
+            *'survives a crash'*) ;;
+            *) echo "data did not survive a full cluster restart"; exit 1 ;;
+          esac
+
+          scripts/cluster.sh stop
+
+      - name: Cluster logs
+        if: failure()
+        run: |
+          for log in .cluster/*.log; do
+            echo "===== $log ====="
+            cat "$log"
+          done

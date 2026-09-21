@@ -563,3 +563,79 @@ func TestPlainStoreIgnoresHeaders(t *testing.T) {
 		t.Errorf("store: %q, %v; want the write to have landed", got, err)
 	}
 }
+
+// TestReadyIsDistinctFromHealth guards an operational trap. A node answers
+// /health the instant it binds its port, well before it has taken part in an
+// election, so anything that starts sending requests then gets "no leader
+// elected" for its trouble.
+func TestReadyIsDistinctFromHealth(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		cluster    api.Cluster
+		wantStatus int
+		wantReady  bool
+	}{
+		{
+			name:       "no leader elected yet",
+			cluster:    stubCluster{status: replica.Status{ID: "n1", Role: "follower", Term: 0}},
+			wantStatus: http.StatusServiceUnavailable,
+			wantReady:  false,
+		},
+		{
+			name:       "a leader is known",
+			cluster:    stubCluster{status: replica.Status{ID: "n1", Role: "follower", Leader: "n2"}},
+			wantStatus: http.StatusOK,
+			wantReady:  true,
+		},
+		{
+			name:       "this node leads",
+			cluster:    stubCluster{status: replica.Status{ID: "n1", Role: "leader", Leader: "n1"}},
+			wantStatus: http.StatusOK,
+			wantReady:  true,
+		},
+		{
+			name:       "no consensus layer at all",
+			cluster:    nil,
+			wantStatus: http.StatusOK,
+			wantReady:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			opts := []api.Option{}
+			if tc.cluster != nil {
+				opts = append(opts, api.WithCluster(tc.cluster))
+			}
+			h := api.NewServer(store.New(), nil, opts...).Handler()
+
+			// Liveness is unconditional: the process is up either way, and
+			// restarting a node mid-election would be exactly wrong.
+			if rec := do(t, h, http.MethodGet, "/health", ""); rec.Code != http.StatusOK {
+				t.Errorf("/health status = %d, want %d regardless of election state",
+					rec.Code, http.StatusOK)
+			}
+
+			rec := do(t, h, http.MethodGet, "/ready", "")
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("/ready status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+
+			var got struct {
+				Ready  bool   `json:"ready"`
+				Reason string `json:"reason"`
+			}
+			decode(t, rec, &got)
+			if got.Ready != tc.wantReady {
+				t.Errorf("ready = %v, want %v", got.Ready, tc.wantReady)
+			}
+			if !tc.wantReady && got.Reason == "" {
+				t.Error("a not-ready response carried no reason")
+			}
+		})
+	}
+}

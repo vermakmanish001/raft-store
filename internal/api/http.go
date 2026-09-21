@@ -109,6 +109,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /kv/{key}", s.handleDelete)
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /status", s.handleStatus)
+	mux.HandleFunc("GET /ready", s.handleReady)
 
 	return logRequests(s.logger)(mux)
 }
@@ -216,6 +217,38 @@ func requestFrom(r *http.Request) (replica.Request, bool) {
 // liveness probe is never conflated with readiness to serve reads.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, r, http.StatusOK, healthResponse{Status: "ok"})
+}
+
+// handleReady reports whether this node can serve requests yet.
+//
+// It is distinct from /health, and conflating the two is a real operational
+// trap rather than a stylistic preference. A node answers /health the instant
+// it binds its port, which is well before it has taken part in an election, so
+// anything that starts sending requests at that point gets "no leader elected"
+// for its trouble. Readiness means a leader is known: this node can either
+// serve the request or redirect it.
+//
+// A load balancer wants /health to decide whether to restart the process and
+// /ready to decide whether to send it traffic. Using one for both either
+// restarts healthy nodes during an election or routes to nodes that cannot
+// answer.
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if s.cluster == nil {
+		// No consensus layer, so there is nothing to wait for.
+		s.writeJSON(w, r, http.StatusOK, readyResponse{Ready: true})
+		return
+	}
+
+	status := s.cluster.Status()
+	if status.Leader == "" {
+		s.writeJSON(w, r, http.StatusServiceUnavailable, readyResponse{
+			Ready:  false,
+			Reason: "no leader elected yet",
+		})
+		return
+	}
+
+	s.writeJSON(w, r, http.StatusOK, readyResponse{Ready: true, Leader: status.Leader})
 }
 
 // handleStatus reports consensus state: this node's role, term, and who it
@@ -336,4 +369,10 @@ type errorResponse struct {
 
 type healthResponse struct {
 	Status string `json:"status"`
+}
+
+type readyResponse struct {
+	Ready  bool        `json:"ready"`
+	Leader raft.NodeID `json:"leader,omitempty"`
+	Reason string      `json:"reason,omitempty"`
 }

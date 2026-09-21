@@ -1,5 +1,7 @@
 # raft-store
 
+[![CI](https://github.com/vermakmanish001/raft-store/actions/workflows/ci.yml/badge.svg)](https://github.com/vermakmanish001/raft-store/actions/workflows/ci.yml)
+
 A distributed, strongly-consistent key-value store written in Go, built on a
 from-scratch implementation of the [Raft consensus algorithm](https://raft.github.io/raft.pdf).
 
@@ -141,7 +143,8 @@ terminal and not fine for a client that retries.
 | `GET` | `/kv/{key}` | `200` with `{"key","value"}` | `404` if absent |
 | `PUT` | `/kv/{key}` | `204`, no body | `413` if the value exceeds 1 MiB |
 | `DELETE` | `/kv/{key}` | `204`, no body | `404` if absent |
-| `GET` | `/health` | `200` with `{"status":"ok"}` | |
+| `GET` | `/health` | `200` once the process is up | |
+| `GET` | `/ready` | `200` once a leader is known | `503` during an election |
 | `GET` | `/status` | `200` with role, term, leader, commit and snapshot index | |
 | `POST` | `/raft/message` | `202`, peer RPC, not for clients | |
 
@@ -149,10 +152,16 @@ terminal and not fine for a client that retries.
 because the store does not distinguish the two. An empty body stores an empty
 value, which is a real value and distinct from an absent key.
 
-`/health` reports process liveness only. It deliberately says nothing about
-cluster state: once Raft exists, a node's role and whether it can reach a
-quorum belong on a separate status endpoint, so a liveness probe is never
-conflated with readiness to serve reads.
+`/health` and `/ready` answer different questions, and conflating them is an
+operational trap rather than a stylistic preference. A node answers `/health`
+the instant it binds its port, which is before it has taken part in an
+election, so a client that starts sending requests then receives `503 no
+leader elected`. `/ready` waits until a leader is known, meaning this node can
+either serve the request or redirect it.
+
+A load balancer wants `/health` to decide whether to restart the process and
+`/ready` to decide whether to send it traffic. Using one for both either
+restarts healthy nodes mid-election or routes to nodes that cannot answer.
 
 ### Flags
 
@@ -351,7 +360,10 @@ make race      # tests under the race detector
 make cover     # coverage report, written to coverage.html
 ```
 
-`make check` is the gate a commit is expected to pass.
+`make check` is the gate a commit is expected to pass. The same checks run in
+CI on every push, alongside end-to-end jobs that drive the real binary: a
+single node through the full request suite, a three-node cluster through a
+leader failure, and a whole-cluster restart that recovers from disk.
 
 There is also an end-to-end smoke test that drives a real node over a real
 socket, which catches wiring mistakes that in-process tests cannot see. Start a
